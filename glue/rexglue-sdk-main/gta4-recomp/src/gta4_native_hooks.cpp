@@ -69,6 +69,13 @@ void OptSub821BC690(PPCContext& ctx, uint8_t* base);
 void OptSub821BD0A0(PPCContext& ctx, uint8_t* base);
 void OptSub821BE8A0(PPCContext& ctx, uint8_t* base);
 
+// Batch 3 optimized hook forward declarations
+void OptSub824F6AF0(PPCContext& ctx, uint8_t* base);
+void OptSub828C4578(PPCContext& ctx, uint8_t* base);
+void OptSub82271FF8(PPCContext& ctx, uint8_t* base);
+void OptSub828C8DB0(PPCContext& ctx, uint8_t* base);
+void OptSub828C8E80(PPCContext& ctx, uint8_t* base);
+
 REXCVAR_DECLARE(uint32_t, gta4_shadow_map_base_size);
 REXCVAR_DEFINE_UINT32(gta4_shadow_cascade_count, 0, "GTA IV/Graphics/Shadows",
                       "Directional shadow cascades (0 keeps the stock 5)")
@@ -4959,12 +4966,12 @@ extern "C" void sub_828C4338(PPCContext& ctx, uint8_t* base) {
   // capturing the model actually being executed in this nested call.
   temporal_host::Scope temporal_scope(temporal_host::instance.matrix, ctx.r3.u32,
                                       temporal_host::instance.pose);
-  __imp__sub_828C4578(ctx, base);
+  OptSub828C4578(ctx, base);
 }
 
 extern "C" void sub_828C4578(PPCContext& ctx, uint8_t* base) {
   if (!temporal_host::enabled.load(std::memory_order_relaxed)) [[likely]] {
-    __imp__sub_828C4578(ctx, base);
+    OptSub828C4578(ctx, base);
     return;
   }
   SlowSub828C4578(ctx, base);
@@ -5303,6 +5310,10 @@ inline bool ValidateEffectPassTables(const char* fn, uint8_t* base, uint64_t sav
 }  // namespace
 
 extern "C" void sub_828C8DB0(PPCContext& ctx, uint8_t* base) {
+  if (!IsNativeMode()) {
+    OptSub828C8DB0(ctx, base);
+    return;
+  }
   const uint64_t saved_lr = ctx.lr;
   const uint32_t pass = ctx.r3.u32;
   const uint32_t arg1 = ctx.r4.u32;
@@ -5381,7 +5392,7 @@ extern "C" void sub_828C8DB0(PPCContext& ctx, uint8_t* base) {
 
 extern "C" void sub_828C8E80(PPCContext& ctx, uint8_t* base) {
   if (!IsNativeMode()) {
-    __imp__sub_828C8E80(ctx, base);
+    OptSub828C8E80(ctx, base);
     return;
   }
   const uint64_t saved_lr = ctx.lr;
@@ -7934,7 +7945,7 @@ extern "C" void sub_828BD478(PPCContext& ctx, uint8_t* base) {
 extern "C" void sub_82271FF8(PPCContext& ctx, uint8_t* base) {
   const bool trace = IsNativeMode() && IsNativeLightLoopTraceEnabled();
   const uint32_t caller = uint32_t(ctx.lr);
-  __imp__sub_82271FF8(ctx, base);
+  OptSub82271FF8(ctx, base);
   if (trace && ctx.r3.s32 == -1) {
     TraceNativeLocalLightShadowUnavailable(base, ctx, caller);
   }
@@ -8072,7 +8083,7 @@ extern "C" void sub_82A3E910(PPCContext& ctx, uint8_t* base) {
 
 extern "C" void sub_824F6AF0(PPCContext& ctx, uint8_t* base) {
   if (!IsNativeMode()) {
-    __imp__sub_824F6AF0(ctx, base);
+    OptSub824F6AF0(ctx, base);
     return;
   }
 
@@ -8107,7 +8118,7 @@ extern "C" void sub_824F6AF0(PPCContext& ctx, uint8_t* base) {
           device, width, height, outputs[0], outputs[1], outputs[2], outputs[3], alias,
           deferred_depth_surface, primary_depth_surface);
     }
-    __imp__sub_824F6AF0(ctx, base);
+    OptSub824F6AF0(ctx, base);
     return;
   }
 
@@ -8840,3 +8851,4 @@ extern "C" void sub_82A467D8(PPCContext& ctx, uint8_t* base) {
 // #include "gta4_neon_transform_hooks.inc"
 #include "gta4_main_and_drawable_hooks.inc"
 #include "gta4_batch2_hooks.inc"
+#include "gta4_batch3_hooks.inc"

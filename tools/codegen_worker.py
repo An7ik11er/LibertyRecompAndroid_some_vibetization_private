@@ -62,9 +62,41 @@ WORKSPACE_ROOT = resolve_workspace_root()
 GENERATED_DIR = os.path.join(WORKSPACE_ROOT, "glue", "rexglue-sdk-main", "gta4-recomp", "generated")
 CALLGRAPH_DB_PATH = os.path.join(WORKSPACE_ROOT, "Outsider_memory", "!!!!", "rage_callgraph_db.json")
 
-SYSTEM_PROMPT_HOOK = """You are an expert low-level reverse engineer, compiler engineer, and ARM64 systems optimizer for Xbox 360 (PowerPC) recompilation projects running on Android / Snapdragon 888 (Cortex-X1 + Adreno 660).
+CORE_DOMAIN_FACTS = """
+## Domain facts (do not contradict)
+- `PPCContext& ctx` holds VIRTUAL PowerPC guest registers: ctx.r0..r31, ctx.v0..v31, ctx.lr, ctx.ctr, ctx.xer, ctx.cr*. NOT host ARM64 registers.
+- REX_LOAD_*/REX_STORE_* apply BE<->LE byte-swap. Plain vld1q_u8/vst1q_u8 do not. Byte-wise ops (and/or) are endian-agnostic.
+- lvx128/stvx128 in decompiled code emit shuffle_epi8 pairs that cancel. `ea = X & ~0xF` mirrors PPC semantics (low 4 bits ignored), NOT ARM alignment.
+- `__imp__sub_XXX(ctx, base)` is the RECOMPILED BODY of the same PPC function. Calling it from a hook is normal; no ABI transition happens.
+- `sub_XXX` without __imp__ may be a native ARM64 shim or another recompiled body — if unknown, say so.
+- PPC caller-saved: r0, r3..r12, v0..v19, lr, ctr, cr0..cr1. Everything else is callee-saved and MUST be restored by the function itself.
+- IsPlausibleGuestPtr = range check only. No alignment, no content validation.
 
-Your task is to take decompiled / recompiled PowerPC guest functions and produce high-performance, drop-in replacement C++20 hooks.
+## Anti-filler rules
+- SIMD only if the original processes vector lanes. Scalar pointer loops → skip.
+- Thread-safety only if function touches shared mutable state without atomics. Single-threaded recompiled flow → "N/A: single-threaded guest".
+- Do NOT claim a check prevents X if X is exactly what the check prevents.
+- Do NOT invent behavior of unseen helpers. Write "unknown: <name>".
+- Every claim about equivalence or a bug MUST cite line numbers from BOTH sides.
+"""
+
+CORE_EDGE_CASES = """
+## Mandatory edge-case rules (must strictly satisfy):
+1. Signed vs unsigned arithmetic & comparison: strictly preserve PPC signed offsets (e.g. `lis` with negative `addi`).
+2. Caller-saved guest state: ensure any return value or state expected by callers in `r3`..`r12`, `v0`..`v19` is correctly set.
+3. Callee-saved guest state: do not clobber `r13`..`r31`, `v20`..`v31` in `ctx`, or restore them exactly if modified.
+4. Array CONTENT validation vs pointer-only: check pointer bounds before dereferencing, and never omit array length bounds.
+5. Every `& ~0xF` in hook must match original `ea & ~0xF` at the same offset.
+6. Early return paths must match original exit states and guest stack restoration (`ctx.r1`).
+7. Cross-calls into other recompiled funcs: beware of state they mutate that the hook's prologue/epilogue no longer saves.
+"""
+
+SYSTEM_PROMPT_HOOK = f"""You are an expert low-level reverse engineer, compiler engineer, and ARM64 systems optimizer for Xbox 360 (PowerPC) recompilation projects running on Android / Snapdragon 888 (Cortex-X1 + Adreno 660).
+Be terse. No prose padding. If unsure — write "unknown: <identifier>" instead of guessing.
+
+{CORE_DOMAIN_FACTS}
+
+{CORE_EDGE_CASES}
 
 ### STRICT ABI & RECOMPILATION RULES:
 1. **Function Signature**:
@@ -91,7 +123,7 @@ Your task is to take decompiled / recompiled PowerPC guest functions and produce
 5. **ARM64 & Cortex-X1 Optimizations**:
    - Eliminate redundant guest stack frame allocations and temporary register spills if all callees are inlined or leaf operations.
    - Use ARM64 NEON (`#include <arm_neon.h>`) for vector math, matrix transforms, bounding box checks, and bulk memory copies.
-   - Concurrency / Spinlocks: If `gta4_atomic_sections_lock_flag` is false, use relaxed/acquire-release `__atomic_*` or `std::atomic` instead of heavy global guest locks.
+   - Concurrency / Spinlocks: Single-threaded guest flow (CPU 7). Do NOT add redundant mutexes.
    - NEVER hook or alter functions in the untouchable Audio range `0x82900000-0x8293FFFF`.
 6. **Output Format**:
    Return ONLY valid, compilable C++ code enclosed in ```cpp and ```. Do NOT include explanations outside the code block.
@@ -110,7 +142,11 @@ SYSTEM_PROMPT_VULKAN_DIRECT = SYSTEM_PROMPT_HOOK + """
 - Coalesce state mutations, hoist invariant pointer translations (`REX_RAW_ADDR`) outside loops, and minimize work on `RenderGuest` (CPU 7 Cortex-X1).
 """
 
-SYSTEM_PROMPT_INSPECT = """You are a senior reverse-engineering analyst for the GTA IV (RAGE Engine) Xbox 360 to Android ARM64 Vulkan recompilation project.
+SYSTEM_PROMPT_INSPECT = f"""You are a senior reverse-engineering analyst for the GTA IV (RAGE Engine) Xbox 360 to Android ARM64 Vulkan recompilation project.
+Be terse. No prose padding. If unsure — write "unknown: <identifier>" instead of guessing.
+
+{CORE_DOMAIN_FACTS}
+
 Analyze the provided `DEFINE_REX_FUNC` PowerPC recompilation code and callgraph metadata.
 Output a concise, structured technical brief (maximum 30 lines total) covering:
 1. **Signature & Register Contract**: Inputs in `r3`..`r10`, `f1`..`f8`, `v2`..`v13` and return values.
@@ -120,25 +156,12 @@ Output a concise, structured technical brief (maximum 30 lines total) covering:
    - RAGE culling / matrix / visibility math (candidates for ARM64 NEON vectorization)
    - Untouchable or external subsystems
 4. **Actionable Hook Plan**: Exact strategy to hook or optimize this function on Cortex-X1 without breaking stack restoration (`ctx.r1.u32`) or Big-Endian rules.
+5. **Required Unseen Callees**: Explicitly list any critical callees or struct definitions whose bodies are NOT provided in context but required for confident devirtualization or inlining (instead of guessing or assuming their behavior).
 """
 
-SYSTEM_PROMPT_AUDIT = """You audit C++ hooks that override recompiled PowerPC functions in a rexglue-based emulator (LibertyRecompAndroid). Be terse. No prose padding. If unsure — write "unknown: <identifier>" instead of guessing.
+SYSTEM_PROMPT_AUDIT = f"""You audit C++ hooks that override recompiled PowerPC functions in a rexglue-based emulator (LibertyRecompAndroid). Be terse. No prose padding. If unsure — write "unknown: <identifier>" instead of guessing.
 
-## Domain facts (do not contradict)
-- `PPCContext& ctx` holds VIRTUAL PowerPC guest registers: ctx.r0..r31, ctx.v0..v31, ctx.lr, ctx.ctr, ctx.xer, ctx.cr*. NOT host ARM64 registers.
-- REX_LOAD_*/REX_STORE_* apply BE<->LE byte-swap. Plain vld1q_u8/vst1q_u8 do not. Byte-wise ops (and/or) are endian-agnostic.
-- lvx128/stvx128 in decompiled code emit shuffle_epi8 pairs that cancel. `ea = X & ~0xF` mirrors PPC semantics (low 4 bits ignored), NOT ARM alignment.
-- `__imp__sub_XXX(ctx, base)` is the RECOMPILED BODY of the same PPC function. Calling it from a hook is normal; no ABI transition happens.
-- `sub_XXX` without __imp__ may be a native ARM64 shim or another recompiled body — if unknown, say so.
-- PPC caller-saved: r0, r3..r12, v0..v19, lr, ctr, cr0..cr1. Everything else is callee-saved and MUST be restored by the function itself.
-- IsPlausibleGuestPtr = range check only. No alignment, no content validation.
-
-## Anti-filler rules
-- SIMD only if the original processes vector lanes. Scalar pointer loops → skip.
-- Thread-safety only if function touches shared mutable state without atomics. Single-threaded recompiled flow → "N/A: single-threaded guest".
-- Do NOT claim a check prevents X if X is exactly what the check prevents.
-- Do NOT invent behavior of unseen helpers. Write "unknown: <name>".
-- Every claim about equivalence or a bug MUST cite line numbers from BOTH sides.
+{CORE_DOMAIN_FACTS}
 
 ## Mandatory edge-case checks (report each: match / divergence / N-A)
 1. Signed vs unsigned comparison divergence.
@@ -487,7 +510,7 @@ def main():
     parser.add_argument("--spec", default="", help="Additional optimization requirements or domain rules")
     parser.add_argument("--extract-only", action="store_true", help="Only extract functions from generated recomp without calling LLM")
     parser.add_argument("--api-key", default="", help="Custom NVIDIA API key")
-    parser.add_argument("--max-tokens", type=int, default=4096, help="Max output tokens for completion")
+    parser.add_argument("--max-tokens", type=int, default=8192, help="Max output tokens for completion")
     parser.add_argument("--retries", type=int, default=2, help="Number of auto-repair retries if code validation fails")
 
     args = parser.parse_args()
