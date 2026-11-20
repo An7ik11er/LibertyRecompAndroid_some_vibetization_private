@@ -569,6 +569,14 @@ REXCVAR_DEFINE_STRING(
 REXCVAR_DEFINE_BOOL(
     gta4_native_pipeline_prewarm, true, "GTA IV/Graphics/Native Renderer",
     "Compile draw pipelines on the render worker as draw commands arrive, before frame recording");
+REXCVAR_DEFINE_BOOL(
+    gta4_native_prewarm_recipes, true, "GTA IV/Graphics/Native Renderer",
+    "Load persisted pipeline recipes at startup and warm graphics pipelines in the background "
+    "on Little cores during loading screens (*0x831D5335 != 0)");
+REXCVAR_DEFINE_UINT32(
+    gta4_native_pipeline_compiler_threads, 2, "GTA IV/Graphics/Native Renderer",
+    "Number of Little-core background Vulkan pipeline compiler threads (1-2)")
+    .range(1, 2);
 
 REXCVAR_DEFINE_BOOL(gta4_trace_artificial_lights, false, "GTA IV/Diagnostics",
                     "Emit bounded pipeline, coverage, depth, stencil, target, and deferred-input "
@@ -4861,6 +4869,21 @@ bool Gta4NativeGraphicsSystem::ExecuteTitleCommand(uint32_t title_id, uint32_t a
       }
     }
     if (result && result_size >= sizeof(state)) std::memcpy(result, &state, sizeof(state));
+    return true;
+  }
+  constexpr uint32_t kLoadingStateAbi = 0x4C445331;  // 'LDS1'
+  if (abi_version == kLoadingStateAbi) {
+    if (title_id != kTitleId || !command || command_size < sizeof(uint32_t)) {
+      return false;
+    }
+    uint32_t active = 0;
+    std::memcpy(&active, command, sizeof(active));
+    const bool next_loading = active != 0;
+    const bool prev_loading = guest_loading_active_.exchange(next_loading, std::memory_order_acq_rel);
+    if (prev_loading != next_loading) {
+      REXLOG_WARN("gta4-native-warmup: guest loading state changed {} -> {}",
+                  prev_loading ? 1 : 0, next_loading ? 1 : 0);
+    }
     return true;
   }
   TvTraceContext tv_context{};
@@ -19807,13 +19830,19 @@ bool Gta4NativeGraphicsSystem::InitializeNativeRendererObjects() {
     REXLOG_WARN("gta4-native: GPU texture detiling unavailable; textures convert on the CPU");
   }
   native_pipeline_compiler_ = std::make_unique<NativePipelineCompilerState>();
-  native_pipeline_compiler_->writer = std::make_unique<NativePipelineCompilerState::Writer>(1);
+  native_pipeline_compiler_->writer =
+      std::make_unique<NativePipelineCompilerState::Writer>(1, std::function<void()>{}, 1, "GtaPipeWrite");
   native_pipeline_compiler_->checkpoint_tick.store(rex::chrono::Clock::QueryHostTickCount());
+  const size_t compiler_threads =
+      std::clamp<size_t>(REXCVAR_GET(gta4_native_pipeline_compiler_threads), 1, 2);
   native_pipeline_compiler_->compiler = std::make_unique<NativePipelineCompilerState::Compiler>(
-      64, [this] { ScheduleNativePipelineCheckpoint(); });
-  //LoadNativePipelineRecipes();
-  //ReplayNativePipelineRecipes();
+      64, [this] { ScheduleNativePipelineCheckpoint(); }, compiler_threads, "GtaPipeCompile");
   const uint64_t hitch_recipes_begin = FrameTimelineNow();
+  if (REXCVAR_GET(gta4_native_prewarm_recipes)) {
+    LoadNativePipelineRecipes();
+    REXLOG_WARN("gta4-native-warmup: loaded {} persisted pipeline recipes (threads={})",
+                native_pipeline_compiler_->replay.size(), compiler_threads);
+  }
   ReplayNativePipelineRecipes();
   g_hitch_recipes_ns.store(FrameTimelineNow() - hitch_recipes_begin,
                            std::memory_order_relaxed);
@@ -20011,16 +20040,45 @@ void Gta4NativeGraphicsSystem::ReplayNativePipelineRecipes() {
   }
   DrainNativePipelineCompiles();
   auto& state = *native_pipeline_compiler_;
+  const bool loading_active = guest_loading_active_.load(std::memory_order_acquire);
+  if (prev_replay_loading_active_ && !loading_active && REXCVAR_GET(gta4_native_prewarm_recipes)) {
+    const size_t pending_before = state.compiler->PendingCount();
+    if (pending_before > 0) {
+      const auto wait_begin = std::chrono::steady_clock::now();
+      const bool drained_clean = state.compiler->WaitUntilIdleFor(std::chrono::milliseconds(1500));
+      DrainNativePipelineCompiles();
+      const auto waited_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - wait_begin)
+                                 .count();
+      REXLOG_WARN(
+          "gta4-native-warmup: loading->gameplay drain waited={}ms pending={}->{} idle={} remaining_recipes={}",
+          waited_ms, pending_before, state.compiler->PendingCount(), drained_clean, state.replay.size());
+    }
+  }
+  prev_replay_loading_active_ = loading_active;
+  if (!REXCVAR_GET(gta4_native_prewarm_recipes)) {
+    return;
+  }
   // Recipes still waiting are missing a shader: nothing can change for them
   // until a shader registers or the compile queue has room again.
   const uint64_t shader_generation = state.shader_generation.load(std::memory_order_relaxed);
   if (!state.replay_retry && state.replay_scanned_generation == shader_generation) {
     return;
   }
+  if (!loading_active && state.compiler->PendingCount() >= 4) {
+    state.replay_retry = true;
+    return;
+  }
   state.replay_scanned_generation = shader_generation;
   state.replay_retry = false;
+  size_t enqueued_this_pass = 0;
+  constexpr size_t kMaxGameplayEnqueuesPerFrame = 2;
   const auto* device = static_cast<ui::vulkan::VulkanProvider*>(provider_.get())->vulkan_device();
   for (auto it = state.replay.begin(); it != state.replay.end();) {
+    if (!loading_active && enqueued_this_pass >= kMaxGameplayEnqueuesPerFrame) {
+      state.replay_retry = true;
+      break;
+    }
     if (it->key.indexed_descriptors && !native_descriptor_layouts_update_after_bind_) {
       ++it;
       continue;
@@ -20121,6 +20179,7 @@ void Gta4NativeGraphicsSystem::ReplayNativePipelineRecipes() {
         state.records.emplace(key, recipe.data);
       }
     }
+    ++enqueued_this_pass;
     it = state.replay.erase(it);
   }
 }

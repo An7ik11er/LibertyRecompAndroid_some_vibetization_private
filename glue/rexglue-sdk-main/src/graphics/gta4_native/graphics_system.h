@@ -4155,6 +4155,8 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   std::atomic<uint64_t> native_pipeline_cache_generation_{0};
   uint64_t native_pipeline_cache_saved_generation_ = 0;
   std::unique_ptr<NativePipelineCompilerState> native_pipeline_compiler_;
+  std::atomic<bool> guest_loading_active_{true};
+  bool prev_replay_loading_active_{true};
   uint64_t native_pipeline_unreported_compile_ticks_ = 0;
   uint64_t native_pipeline_unreported_wait_ticks_ = 0;
   uint64_t native_pipeline_unreported_creates_ = 0;

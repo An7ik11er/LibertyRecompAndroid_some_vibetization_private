@@ -3,6 +3,9 @@
 
 #include <rex/chrono/clock.h>
 #include <rex/audio/handoff_trace.h>
+#include <rex/graphics/gta4_native/title_commands.h>
+#include <rex/runtime.h>
+#include <rex/system/interfaces/graphics.h>
 #include <rex/system/kernel_state.h>
 #include <rex/memory.h>
 #include <rex/diagnostics/gta4_transition.h>
@@ -14,6 +17,25 @@
 namespace {
 
 constexpr uint32_t kLoadingActiveGlobal = 0x831D5335;
+constexpr uint32_t kLoadingStateAbi = 0x4C445331;  // 'LDS1'
+
+void NotifyNativeGraphicsLoadingState(bool active) {
+  static std::atomic<int> s_last_loading_state{-1};
+  const int next = active ? 1 : 0;
+  if (s_last_loading_state.load(std::memory_order_relaxed) == next) {
+    return;
+  }
+  auto* runtime = rex::Runtime::instance();
+  auto* graphics = runtime ? runtime->graphics_system() : nullptr;
+  if (!graphics) {
+    return;
+  }
+  uint32_t payload = active ? 1u : 0u;
+  if (graphics->ExecuteTitleCommand(rex::graphics::gta4_native::kTitleId, kLoadingStateAbi,
+                                    &payload, sizeof(payload), nullptr, 0)) {
+    s_last_loading_state.store(next, std::memory_order_relaxed);
+  }
+}
 constexpr uint32_t kLoadingReadyGlobal = 0x831D5336;
 constexpr uint32_t kLoadingCompleteGlobal = 0x831D5337;
 constexpr uint32_t kLoadingScreenIndexGlobal = 0x831D5340;
@@ -38,16 +60,20 @@ uint64_t ReadLoadingStateBits(uint8_t* base) {
 }  // namespace
 
 extern "C" void sub_82144188(PPCContext& ctx, uint8_t* base) {
+  const bool active_before = REX_LOAD_U8(kLoadingActiveGlobal) != 0;
+  NotifyNativeGraphicsLoadingState(active_before);
   rex::diagnostics::gta4_transition::NoteLoadingTick(
       0x82144188, static_cast<uint32_t>(ctx.lr),
-      REX_LOAD_U8(kLoadingActiveGlobal) != 0,
+      active_before,
       REX_LOAD_U32(kLoadingScreenIndexGlobal), ReadLoadingStateBits(base));
-  rex::audio::handoff::Loading(0x82144188,uint32_t(ctx.lr),REX_LOAD_U8(kLoadingActiveGlobal)!=0,REX_LOAD_U32(kLoadingScreenIndexGlobal),ReadLoadingStateBits(base));
+  rex::audio::handoff::Loading(0x82144188,uint32_t(ctx.lr),active_before,REX_LOAD_U32(kLoadingScreenIndexGlobal),ReadLoadingStateBits(base));
   __imp__sub_82144188(ctx, base);
-  rex::audio::handoff::Loading(0x82144188,uint32_t(ctx.lr),REX_LOAD_U8(kLoadingActiveGlobal)!=0,REX_LOAD_U32(kLoadingScreenIndexGlobal),ReadLoadingStateBits(base));
+  const bool active_after = REX_LOAD_U8(kLoadingActiveGlobal) != 0;
+  NotifyNativeGraphicsLoadingState(active_after);
+  rex::audio::handoff::Loading(0x82144188,uint32_t(ctx.lr),active_after,REX_LOAD_U32(kLoadingScreenIndexGlobal),ReadLoadingStateBits(base));
   rex::diagnostics::gta4_transition::NoteLoadingTick(
       0x82144188, static_cast<uint32_t>(ctx.lr),
-      REX_LOAD_U8(kLoadingActiveGlobal) != 0,
+      active_after,
       REX_LOAD_U32(kLoadingScreenIndexGlobal), ReadLoadingStateBits(base));
 }
 
@@ -89,6 +115,7 @@ extern "C" void sub_82145770(PPCContext& ctx, uint8_t* base) {
   }
   rex::audio::handoff::Span handoff_teardown("loading-teardown",0x82145770,caller,argument);
   __imp__sub_82145770(ctx, base);
+  NotifyNativeGraphicsLoadingState(REX_LOAD_U8(kLoadingActiveGlobal) != 0);
   if (is_world_entry_teardown) {
     rex::diagnostics::gta4_transition::NoteLoadingTeardown(
         false, 0x82145770, caller, argument);

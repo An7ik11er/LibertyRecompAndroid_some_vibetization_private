@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -11,19 +12,33 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#if defined(__ANDROID__)
+#include <pthread.h>
+#include <sched.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
 
 namespace rex::graphics::gta4_native {
 
-// One compiler, with bounded admission including unconsumed results. Callers
+// Bounded background compiler with 1-2 Little-core worker threads. Callers
 // publish results on their owner thread. Stop joins the active driver call;
 // shader modules, layouts, caches and the device must outlive this object.
 template <typename Key, typename Result, typename Hash>
 class NativePipelineCompiler {
  public:
   using Compile = std::function<Result()>;
-  explicit NativePipelineCompiler(size_t capacity, std::function<void()> idle = {})
-      : capacity_(std::max<size_t>(capacity, 1)), idle_(std::move(idle)),
-        thread_([this] { Run(); }) {}
+  explicit NativePipelineCompiler(size_t capacity, std::function<void()> idle = {},
+                                  size_t worker_count = 1, const char* thread_name = nullptr)
+      : capacity_(std::max<size_t>(capacity, 1)),
+        idle_(std::move(idle)),
+        thread_name_(thread_name ? thread_name : "") {
+    const size_t workers = std::clamp<size_t>(worker_count, 1, 2);
+    threads_.reserve(workers);
+    for (size_t i = 0; i < workers; ++i) {
+      threads_.emplace_back([this] { Run(); });
+    }
+  }
   ~NativePipelineCompiler() { Stop(); }
   NativePipelineCompiler(const NativePipelineCompiler&) = delete;
   NativePipelineCompiler& operator=(const NativePipelineCompiler&) = delete;
@@ -100,9 +115,18 @@ class NativePipelineCompiler {
     std::lock_guard lock(mutex_);
     return jobs_.contains(key);
   }
+  size_t PendingCount() const {
+    std::lock_guard lock(mutex_);
+    return queue_.size() + active_workers_;
+  }
   void WaitUntilIdle() {
     std::unique_lock lock(mutex_);
-    changed_.wait(lock, [this] { return !active_ && queue_.empty(); });
+    changed_.wait(lock, [this] { return active_workers_ == 0 && queue_.empty(); });
+  }
+  bool WaitUntilIdleFor(std::chrono::milliseconds timeout) {
+    std::unique_lock lock(mutex_);
+    return changed_.wait_for(lock, timeout,
+                             [this] { return active_workers_ == 0 && queue_.empty(); });
   }
   void Stop() {
     {
@@ -111,8 +135,10 @@ class NativePipelineCompiler {
       queue_.clear();
       changed_.notify_all();
     }
-    if (thread_.joinable()) {
-      thread_.join();
+    for (auto& thread : threads_) {
+      if (thread.joinable()) {
+        thread.join();
+      }
     }
   }
 
@@ -121,7 +147,26 @@ class NativePipelineCompiler {
     Compile compile;
     std::optional<Result> result;
   };
+  static void ConfigureWorkerThread(const std::string& thread_name) {
+#if defined(__ANDROID__)
+    if (!thread_name.empty()) {
+      pthread_setname_np(pthread_self(), thread_name.c_str());
+    }
+    setpriority(PRIO_PROCESS, 0, 10);
+    const long ncpus = sysconf(_SC_NPROCESSORS_CONF);
+    const int little_count = (ncpus > 0 && ncpus <= 16) ? int(ncpus / 2) : 4;
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    for (int cpu = 0; cpu < std::max(little_count, 1); ++cpu) {
+      CPU_SET(cpu, &mask);
+    }
+    sched_setaffinity(0, sizeof(mask), &mask);
+#else
+    (void)thread_name;
+#endif
+  }
   void Run() {
+    ConfigureWorkerThread(thread_name_);
     std::unique_lock lock(mutex_);
     for (;;) {
       changed_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
@@ -131,7 +176,7 @@ class NativePipelineCompiler {
       const Key key = queue_.front();
       queue_.pop_front();
       const auto job = jobs_.at(key);
-      active_ = true;
+      ++active_workers_;
       lock.unlock();
       Result result{};
       try {
@@ -143,17 +188,17 @@ class NativePipelineCompiler {
       lock.lock();
       job->result = std::move(result);
       job->compile = {};
-      active_ = false;
+      --active_workers_;
       changed_.notify_all();
-      if (!stopping_ && queue_.empty() && idle_) {
-        active_ = true;
+      if (!stopping_ && active_workers_ == 0 && queue_.empty() && idle_) {
+        ++active_workers_;
         lock.unlock();
         try {
           idle_();
         } catch (...) {
         }
         lock.lock();
-        active_ = false;
+        --active_workers_;
         changed_.notify_all();
       }
     }
@@ -161,13 +206,14 @@ class NativePipelineCompiler {
 
   const size_t capacity_;
   std::function<void()> idle_;
+  std::string thread_name_;
   mutable std::mutex mutex_;
   std::condition_variable changed_;
   bool stopping_ = false;
-  bool active_ = false;
+  size_t active_workers_ = 0;
   std::deque<Key> queue_;
   std::unordered_map<Key, std::shared_ptr<Job>, Hash> jobs_;
-  std::thread thread_;
+  std::vector<std::thread> threads_;
 };
 
 }  // namespace rex::graphics::gta4_native

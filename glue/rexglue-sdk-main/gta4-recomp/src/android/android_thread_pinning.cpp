@@ -396,6 +396,7 @@ ThreadId Classify(const std::string& name, pid_t tid, pid_t primary_recorder, pi
   // its name (NativeVertexCacheOptimizer) and stay helpers, as under GtaRecorder.
   if (name == "GtaRecorder") return tid == primary_recorder ? kRecorder : kRecorderHelpers;
   if (name == "GtaBackend") return tid == primary_recorder ? kBackend : kRecorderHelpers;
+  if (name == "GtaPipeCompile" || name == "GtaPipeWrite") return kRecorderHelpers;
   if (name == "RenderGuest") return kRenderGuest;
   if (name == "GtaCapture") return kCapture;  // 56
   if (Starts(name, "Main XThread")) return kMainXThread;
