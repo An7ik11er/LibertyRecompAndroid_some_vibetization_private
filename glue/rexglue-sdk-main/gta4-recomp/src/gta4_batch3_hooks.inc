@@ -319,36 +319,38 @@ inline void OptSub828C8DB0(PPCContext& ctx, uint8_t* base) {
   sub_828DFF00(ctx, base);
 
   const uint32_t param_count = REX_LOAD_U16(pass + 8u);
-  for (uint32_t i = 0u; i < param_count; ++i) {
+  if (static_cast<int32_t>(param_count) > 0) {
     const uint32_t pair_table = REX_LOAD_U32(pass + 4u);
     const uint32_t type_table = REX_LOAD_U32(shader_data + 16u);
-    const uint32_t val_table = REX_LOAD_U32(shader_data + 0u);
+    const uint32_t val_table  = REX_LOAD_U32(shader_data + 0u);
+    const uint32_t effect_base = REX_LOAD_U32(effect_ptr + 0u);
 
-    const uint16_t pair = REX_LOAD_U16(pair_table + (i << 1));
-    const uint32_t idx0 = static_cast<uint32_t>(pair >> 8);
-    const uint32_t param_idx = static_cast<uint32_t>(pair & 0xFFu);
-    const uint8_t is_const = REX_LOAD_U8(type_table + idx0);
-    const uint32_t val = REX_LOAD_U32(val_table + (idx0 << 2));
+    for (uint32_t i = 0u; i < param_count; ++i) {
+      const uint16_t pair = REX_LOAD_U16(pair_table + (i << 1));
+      const uint32_t idx0 = static_cast<uint32_t>(pair >> 8);
+      const uint32_t param_idx = static_cast<uint32_t>(pair & 0xFFu);
+      const uint8_t is_const = REX_LOAD_U8(type_table + idx0);
+      const uint32_t val = REX_LOAD_U32(val_table + (idx0 << 2));
 
-    if (is_const == 0u) {
-      const uint32_t effect_base = REX_LOAD_U32(effect_ptr + 0u);
-      const uint32_t desc = effect_base + (idx0 * 48u);
-      const uint32_t override_count = static_cast<uint32_t>(REX_LOAD_U8(desc + 2u) >> 1);
-      const uint32_t overrides = REX_LOAD_U32(desc + 24u);
-      ctx.r3.u64 = arg1;
-      ctx.r4.u64 = param_idx;
-      ctx.r5.u64 = val;
-      ctx.r6.u64 = override_count;
-      ctx.r7.u64 = overrides;
-      ctx.lr = 0x828C8E3Cu;
-      sub_828E01B8(ctx, base);
-    } else {
-      ctx.r3.u64 = arg1;
-      ctx.r4.u64 = param_idx;
-      ctx.r5.u64 = val;
-      ctx.r6.u64 = is_const;
-      ctx.lr = 0x828C8E64u;
-      sub_828E0348(ctx, base);
+      if (is_const == 0u) {
+        const uint32_t desc = effect_base + (idx0 * 48u);
+        const uint32_t override_count = static_cast<uint32_t>(REX_LOAD_U8(desc + 2u) >> 1);
+        const uint32_t overrides = REX_LOAD_U32(desc + 24u);
+        ctx.r3.u64 = arg1;
+        ctx.r4.u64 = param_idx;
+        ctx.r5.u64 = val;
+        ctx.r6.u64 = override_count;
+        ctx.r7.u64 = overrides;
+        ctx.lr = 0x828C8E3Cu;
+        sub_828E01B8(ctx, base);
+      } else {
+        ctx.r3.u64 = arg1;
+        ctx.r4.u64 = param_idx;
+        ctx.r5.u64 = val;
+        ctx.r6.u64 = is_const;
+        ctx.lr = 0x828C8E64u;
+        sub_828E0348(ctx, base);
+      }
     }
   }
 
@@ -380,36 +382,38 @@ inline void OptSub828C8E80(PPCContext& ctx, uint8_t* base) {
   sub_828DFF28(ctx, base);
 
   const uint32_t param_count = REX_LOAD_U16(pass + 8u);
-  for (uint32_t i = 0u; i < param_count; ++i) {
+  if (static_cast<int32_t>(param_count) > 0) {
     const uint32_t pair_table = REX_LOAD_U32(pass + 4u);
     const uint32_t type_table = REX_LOAD_U32(shader_data + 16u);
-    const uint32_t val_table = REX_LOAD_U32(shader_data + 0u);
+    const uint32_t val_table  = REX_LOAD_U32(shader_data + 0u);
+    const uint32_t effect_base = REX_LOAD_U32(effect_ptr + 0u);
 
-    const uint16_t pair = REX_LOAD_U16(pair_table + (i << 1));
-    const uint32_t idx0 = static_cast<uint32_t>(pair >> 8);
-    const uint32_t param_idx = static_cast<uint32_t>(pair & 0xFFu);
-    const uint8_t is_const = REX_LOAD_U8(type_table + idx0);
-    const uint32_t val = REX_LOAD_U32(val_table + (idx0 << 2));
+    for (uint32_t i = 0u; i < param_count; ++i) {
+      const uint16_t pair = REX_LOAD_U16(pair_table + (i << 1));
+      const uint32_t idx0 = static_cast<uint32_t>(pair >> 8);
+      const uint32_t param_idx = static_cast<uint32_t>(pair & 0xFFu);
+      const uint8_t is_const = REX_LOAD_U8(type_table + idx0);
+      const uint32_t val = REX_LOAD_U32(val_table + (idx0 << 2));
 
-    if (is_const == 0u) {
-      const uint32_t effect_base = REX_LOAD_U32(effect_ptr + 0u);
-      const uint32_t desc = effect_base + (idx0 * 48u);
-      const uint32_t override_count = static_cast<uint32_t>(REX_LOAD_U8(desc + 2u) >> 1);
-      const uint32_t overrides = REX_LOAD_U32(desc + 24u);
-      ctx.r3.u64 = arg1;
-      ctx.r4.u64 = param_idx;
-      ctx.r5.u64 = val;
-      ctx.r6.u64 = override_count;
-      ctx.r7.u64 = overrides;
-      ctx.lr = 0x828C8F08u;
-      sub_828E02B0(ctx, base);
-    } else {
-      ctx.r3.u64 = arg1;
-      ctx.r4.u64 = param_idx;
-      ctx.r5.u64 = val;
-      ctx.r6.u64 = is_const;
-      ctx.lr = 0x828C8F1Cu;
-      sub_828E0360(ctx, base);
+      if (is_const == 0u) {
+        const uint32_t desc = effect_base + (idx0 * 48u);
+        const uint32_t override_count = static_cast<uint32_t>(REX_LOAD_U8(desc + 2u) >> 1);
+        const uint32_t overrides = REX_LOAD_U32(desc + 24u);
+        ctx.r3.u64 = arg1;
+        ctx.r4.u64 = param_idx;
+        ctx.r5.u64 = val;
+        ctx.r6.u64 = override_count;
+        ctx.r7.u64 = overrides;
+        ctx.lr = 0x828C8F08u;
+        sub_828E02B0(ctx, base);
+      } else {
+        ctx.r3.u64 = arg1;
+        ctx.r4.u64 = param_idx;
+        ctx.r5.u64 = val;
+        ctx.r6.u64 = is_const;
+        ctx.lr = 0x828C8F1Cu;
+        sub_828E0360(ctx, base);
+      }
     }
   }
 

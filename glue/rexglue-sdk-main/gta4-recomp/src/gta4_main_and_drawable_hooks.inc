@@ -317,7 +317,8 @@ extern "C" void FastSub828C6568(PPCContext& ctx, uint8_t* base) {
 
 // -----------------------------------------------------------------------------
 // 4. FastSub828C6620: rage::grmShader::DrawPass (gta4_recomp.70.cpp:55690-55857)
-// Eliminates 22 register moves around sub_828C8F38 and inlines sub_828C42F0.
+// Eliminates 22 register moves around sub_828C8F38, inlines FastSub828C8F38 directly
+// into the pass loop, and hoists invariant tables (vs_base, ps_base, grc_dev).
 // -----------------------------------------------------------------------------
 extern "C" void FastSub828C6620(PPCContext& ctx, uint8_t* base) {
   REX_FUNC_PROLOGUE();
@@ -342,12 +343,21 @@ extern "C" void FastSub828C6620(PPCContext& ctx, uint8_t* base) {
   if (r23_pass_count > 0) {
     const uint32_t r27_shader_plus_20 = r29_shader + 20u;
     const uint32_t shader_data = REX_LOAD_U32(r29_shader + 24u);
-    const uint32_t shader_data_8  = shader_data + 8u;
+    const uint32_t shader_data_8 = shader_data + 8u;
     const uint32_t shader_data_16 = shader_data + 16u;
     const uint32_t shader_data_24 = shader_data + 24u;
 
+    // Hoist invariant tables and bases outside of the passes loop
+    const uint32_t r26_vs_table = shader_data_16;
+    const uint32_t r25_ps_table = shader_data_24;
+    const uint32_t vs_base = IsPlausibleGuestPtr(r26_vs_table) ? REX_LOAD_U32(r26_vs_table) : 0u;
+    const uint32_t ps_base = IsPlausibleGuestPtr(r25_ps_table) ? REX_LOAD_U32(r25_ps_table) : 0u;
+    const uint32_t grc_dev = LoadU32(base, 0x831C22A4u);
+
+    static std::atomic<uint32_t> s_pass_diag_count{0};
+
     uint32_t r31_pass_offset = 0u;
-    constexpr uint32_t kGlobalBase = 0x831C0000u;  // lis -31972
+    constexpr uint32_t kGlobalBase = 0x831C0000u; // lis -31972
     const uint32_t geom_array = REX_LOAD_U32(r25_model + 4u);
     const uint32_t geom = REX_LOAD_U32(geom_array + ((r24_geom_idx << 2) & 0xFFFFFFFCu));
     const uint32_t vtable = REX_LOAD_U32(geom);
@@ -358,17 +368,95 @@ extern "C" void FastSub828C6620(PPCContext& ctx, uint8_t* base) {
       const uint32_t pass_base = REX_LOAD_U32(effect_inst + 8u);
       const uint32_t cur_pass = pass_base + r31_pass_offset;
 
-      ctx.r10.u64 = pass_base;
-      ctx.r11.u64 = shader_data;
-      ctx.r6.u64 = r27_shader_plus_20;
-      ctx.r7.u64 = shader_data_8;
-      ctx.r5.u64 = shader_data_24;
-      ctx.r4.u64 = shader_data_16;
-      ctx.r3.u64 = cur_pass;
       REX_STORE_U32(kGlobalBase + 15836u, cur_pass);
 
-      ctx.lr = 0x828C6690u;
-      sub_828C8F38(ctx, base);
+      if (FireTraceConfig().enabled) [[unlikely]] {
+        // Fallback to original slow path for tracing
+        ctx.r10.u64 = pass_base;
+        ctx.r11.u64 = shader_data;
+        ctx.r6.u64 = r27_shader_plus_20;
+        ctx.r7.u64 = shader_data_8;
+        ctx.r5.u64 = shader_data_24;
+        ctx.r4.u64 = shader_data_16;
+        ctx.r3.u64 = cur_pass;
+        ctx.lr = 0x828C6690u;
+        sub_828C8F38(ctx, base);
+      } else {
+        // Fast path: Inlined FastSub828C8F38
+        if (!IsPlausibleGuestPtr(cur_pass)) {
+          if (s_pass_diag_count.fetch_add(1, std::memory_order_relaxed) < 16u) {
+            REXLOG_WARN("diag-828C8F38: bad-pass pass={:08X} tech={:08X} g82CBBE18={:08X}",
+                        cur_pass, LoadU32(base, 0x831C3DE0u),
+                        LoadU32(base, 0x82CBBE18u));
+          }
+        } else {
+          const uint16_t state_count = REX_LOAD_U16(cur_pass + 28u);
+          if (state_count > 0u) {
+            const uint32_t states = REX_LOAD_U32(cur_pass + 24u);
+            if (state_count > 128u || !IsPlausibleGuestPtr(states)) {
+              if (s_pass_diag_count.fetch_add(1, std::memory_order_relaxed) < 16u) {
+                REXLOG_WARN("diag-828E02E8: bad-states pass={:08X} cnt={} states={:08X} tech={:08X}",
+                            cur_pass, state_count, states, LoadU32(base, 0x831C3DE0u));
+              }
+            } else {
+              uint32_t state_off = 0u;
+              for (uint16_t i = 0; i < state_count; ++i) {
+                const uint32_t state_id = REX_LOAD_U32(states + state_off);
+                const uint32_t state_val = REX_LOAD_U32(states + state_off + 4u);
+                uint32_t offset = 0xFFFFFFFFu;
+                uint32_t target = 0u;
+                if (state_id < 512u && IsPlausibleGuestPtr(grc_dev)) {
+                  offset = LoadU32(base, 0x82B0D8F8u + (state_id << 2));
+                  if (offset < 0x10000u) {
+                    target = LoadU32(base, grc_dev + offset + 64u);
+                  }
+                }
+                if (!IsPlausibleGuestPtr(target)) {
+                  if (s_pass_diag_count.fetch_add(1, std::memory_order_relaxed) < 16u) {
+                    REXLOG_WARN(
+                        "diag-828E02E8: bad-target pass={:08X} i={}/{} id={} val={:08X} grc={:08X} off={:08X} "
+                        "target={:08X} tech={:08X} g82CBBE18={:08X}",
+                        cur_pass, i, state_count, state_id, state_val, grc_dev, offset, target,
+                        LoadU32(base, 0x831C3DE0u), LoadU32(base, 0x82CBBE18u));
+                  }
+                } else {
+                  ctx.r3.u64 = state_id;
+                  ctx.r4.u64 = state_val;
+                  ctx.lr = 0x828C8F7Cu;
+                  sub_828E02E8(ctx, base);
+                }
+                state_off += 8u;
+              }
+            }
+          }
+
+          const uint32_t vs_idx = REX_LOAD_U32(cur_pass);
+          if (vs_idx < 1024u && IsPlausibleGuestPtr(vs_base)) {
+            ctx.r3.u64 = cur_pass;
+            ctx.r4.u64 = vs_base + (((vs_idx * 3u) << 2) & 0xFFFFFFFCu);
+            ctx.r5.u64 = r27_shader_plus_20;
+            ctx.r6.u64 = shader_data_8;
+            ctx.lr = 0x828C8FB4u;
+            sub_828C8DB0(ctx, base);
+          } else if (s_pass_diag_count.fetch_add(1, std::memory_order_relaxed) < 16u) {
+            REXLOG_WARN("diag-828C8F38: bad-vs pass={:08X} vs_idx={} vs_tab={:08X} vs_base={:08X}",
+                        cur_pass, vs_idx, r26_vs_table, vs_base);
+          }
+
+          const uint32_t ps_idx = REX_LOAD_U32(cur_pass + 12u);
+          if (ps_idx < 1024u && IsPlausibleGuestPtr(ps_base)) {
+            ctx.r3.u64 = cur_pass + 12u;
+            ctx.r4.u64 = ps_base + (((ps_idx * 3u) << 2) & 0xFFFFFFFCu);
+            ctx.r5.u64 = r27_shader_plus_20;
+            ctx.r6.u64 = shader_data_8;
+            ctx.lr = 0x828C8FDCu;
+            sub_828C8E80(ctx, base);
+          } else if (s_pass_diag_count.fetch_add(1, std::memory_order_relaxed) < 16u) {
+            REXLOG_WARN("diag-828C8F38: bad-ps pass={:08X} ps_idx={} ps_tab={:08X} ps_base={:08X}",
+                        cur_pass, ps_idx, r25_ps_table, ps_base);
+          }
+        }
+      } // end fast path inline
 
       ctx.r3.u64 = geom;
       ctx.lr = 0x828C669Cu;
