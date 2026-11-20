@@ -257,9 +257,7 @@ public class LibertyActivity extends SDLActivity {
         if (intent == null || !intent.hasExtra(EXTRA_SHADOWS_OFF)) return;
         boolean splitRenderGuest = intent.getBooleanExtra(EXTRA_SPLIT_RENDER_GUEST, false);
         arguments.removeIf(a -> a.startsWith("--gta4_native_split_render_guest"));
-        if (splitRenderGuest) {
-            arguments.add("--gta4_native_split_render_guest=true");
-        }
+        arguments.add("--gta4_native_split_render_guest=" + splitRenderGuest);
         boolean shadowsOff = intent.getBooleanExtra(EXTRA_SHADOWS_OFF, false);
         // 0 = off.
         int water = Math.max(0, Math.min(intent.getIntExtra(EXTRA_WATER_REFLECTION_INTERVAL, 1), 3));

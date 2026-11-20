@@ -511,11 +511,8 @@ bool Gta4NativeGraphicsSystem::ClearGuestOutputStreamed(
     const PresentCommand& present,
     const std::shared_ptr<const NativeTextureResource>& present_source,
     const std::shared_ptr<const EnvironmentalDataV2>& environmental_data) {
-  static const bool sgsr_configured = rex::cvar::Query<std::string>("gta4_native_upscaler") == "sgsr";
-  const bool sgsr_upscale_active = sgsr_configured && !IsNativeSsaaEnabled() &&
-      (display_width > width || display_height > height);
-  const uint32_t guest_output_width = sgsr_upscale_active ? display_width : width;
-  const uint32_t guest_output_height = sgsr_upscale_active ? display_height : height;
+  const uint32_t guest_output_width = width;
+  const uint32_t guest_output_height = height;
 
   const profile::CpuScope profile_scope(profile::CpuOp::kRefreshOutput);
   if (!presenter_ || !provider_) {

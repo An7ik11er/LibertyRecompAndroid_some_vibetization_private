@@ -37210,9 +37210,7 @@ const bool keeps_draw_state =
             : (frontbuffer->width != frontbuffer->logical_width ||
                surface->logical_width != frontbuffer->logical_width) ? 10
             : (!surface->ever_written || surface->layout == VK_IMAGE_LAYOUT_UNDEFINED) ? 11 : 0;
-        static const bool sgsr_configured = rex::cvar::Query<std::string>("gta4_native_upscaler") == "sgsr";
         const bool eligible =
-            !sgsr_configured &&
             frontbuffer && surface && (!owner || owner->image == surface) && !cpu_read &&
             (other_use == texture_input_frames_.end() || other_use->second + 120 < submitted_frame) &&
             (flags & 7u) != 4u && !(flags & 0x300u) && !resolve.parameters_valid &&
@@ -42338,11 +42336,8 @@ bool Gta4NativeGraphicsSystem::ClearGuestOutput(
     const PresentCommand& present,
     const std::shared_ptr<const NativeTextureResource>& present_source,
     const std::shared_ptr<const EnvironmentalDataV2>& environmental_data) {
-  static const bool sgsr_configured = rex::cvar::Query<std::string>("gta4_native_upscaler") == "sgsr";
-  const bool sgsr_upscale_active = sgsr_configured && !IsNativeSsaaEnabled() &&
-      (display_width > width || display_height > height);
-  const uint32_t guest_output_width = sgsr_upscale_active ? display_width : width;
-  const uint32_t guest_output_height = sgsr_upscale_active ? display_height : height;
+  const uint32_t guest_output_width = width;
+  const uint32_t guest_output_height = height;
 
   // 60: a streamed frame was prepared and recorded while it was assembled: only its tail,
   // the presentation and the submission are left.
