@@ -28358,30 +28358,31 @@ void Gta4NativeGraphicsSystem::ReportRenderingScopes() {
   // resolve conversion, depth resolve conversion (2), surface materialization, depth surface
   // handoff (2), resolve clears, present, the frame's draws (2).
   const auto& s = c.by_site;
+  const double lazy_skipped = per(g_lazy_resolves_skipped.exchange(0));
   REXLOG_WARN(
       "gta4-native-scopes: {:.1f} s: frames={} per frame: scopes={:.1f} "
       "[alias={:.1f} resolve={:.1f} depth-resolve={:.1f}/{:.1f} materialize={:.1f} "
       "handoff={:.1f}/{:.1f} clears={:.1f} present={:.1f} draws={:.1f}/{:.1f}] "
       "color load/clear/dont-care={:.1f}/{:.1f}/{:.1f} depth load/clear/dont-care="
-      "{:.1f}/{:.1f}/{:.1f} stores={:.1f} Mpx loaded={:.2f} stored={:.2f}",
+      "{:.1f}/{:.1f}/{:.1f} stores={:.1f} Mpx loaded={:.2f} stored={:.2f} lazy-skipped={:.1f}",
       double(now - rendering_scope_report_tick_) / double(frequency), c.frames, per(c.scopes),
       per(s[0]), per(s[1]), per(s[2]), per(s[3]), per(s[4]), per(s[5]), per(s[6]), per(s[7]),
       per(s[8]), per(s[9]), per(s[10]), per(c.color_load), per(c.color_clear),
       per(c.color_dont_care), per(c.depth_load), per(c.depth_clear), per(c.depth_dont_care),
-      per(c.attachment_stores), per(c.load_pixels) / 1e6, per(c.store_pixels) / 1e6);
+      per(c.attachment_stores), per(c.load_pixels) / 1e6, per(c.store_pixels) / 1e6, lazy_skipped);
 #if defined(__ANDROID__)
   __android_log_print(
       ANDROID_LOG_WARN, "LibertyRecomp",
       "gta4-native-scopes: %.1f s: frames=%llu per frame: scopes=%.1f "
       "[alias=%.1f resolve=%.1f depth-resolve=%.1f/%.1f materialize=%.1f handoff=%.1f/%.1f "
       "clears=%.1f present=%.1f draws=%.1f/%.1f] color load/clear/dont-care=%.1f/%.1f/%.1f "
-      "depth load/clear/dont-care=%.1f/%.1f/%.1f stores=%.1f Mpx loaded=%.2f stored=%.2f",
+      "depth load/clear/dont-care=%.1f/%.1f/%.1f stores=%.1f Mpx loaded=%.2f stored=%.2f lazy-skipped=%.1f",
       double(now - rendering_scope_report_tick_) / double(frequency),
       static_cast<unsigned long long>(c.frames), per(c.scopes), per(s[0]), per(s[1]), per(s[2]),
       per(s[3]), per(s[4]), per(s[5]), per(s[6]), per(s[7]), per(s[8]), per(s[9]), per(s[10]),
       per(c.color_load), per(c.color_clear), per(c.color_dont_care), per(c.depth_load),
       per(c.depth_clear), per(c.depth_dont_care), per(c.attachment_stores),
-      per(c.load_pixels) / 1e6, per(c.store_pixels) / 1e6);
+      per(c.load_pixels) / 1e6, per(c.store_pixels) / 1e6, lazy_skipped);
 #endif
   rendering_scope_report_tick_ = now;
   c = {};
