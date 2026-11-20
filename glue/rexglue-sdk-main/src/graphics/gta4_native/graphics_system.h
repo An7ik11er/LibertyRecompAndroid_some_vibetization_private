@@ -1733,6 +1733,12 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     uint32_t created_frame = 0;
     uint32_t last_used_frame = 0;
     uint64_t last_used_submission = 0;
+    struct PendingClearState {
+      bool valid = false;
+      VkClearValue value{};
+      VkImageAspectFlags aspects = 0;
+    };
+    PendingClearState pending_clear{};
     // Resolve swaps (A2) trade this image with a texture's. The texture-side
     // state that belongs to the image travels with it: its mip views and the
     // stable descriptor slot that samples it.
@@ -2597,6 +2603,8 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
                                   uint32_t submitted_frame) const;
   bool RecordResolveClears(VkCommandBuffer command_buffer, const NativeCommand& command,
                            const ResolveCommand& resolve, uint32_t submitted_frame);
+  void FlushPendingSurfaceClear(VkCommandBuffer command_buffer, NativeSurfaceImage& surface,
+                                uint32_t submitted_frame);
   bool ResolveRenderingTarget(const NativeCommand& command, VkImageView presenter_view,
                               uint32_t presenter_width, uint32_t presenter_height,
                               NativeRenderingTarget& target, bool allow_allocation = true,

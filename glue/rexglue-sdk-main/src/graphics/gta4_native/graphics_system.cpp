@@ -399,6 +399,9 @@ REXCVAR_DEFINE_BOOL(gta4_native_coalesce_state_commands, true, "GTA IV/Graphics/
 REXCVAR_DEFINE_BOOL(gta4_native_clear_skips_materialization, true, "GTA IV/Graphics/Native Renderer",
                     "Do not copy a surface's aliased EDRAM content into it when a clear covering "
                     "the whole surface is about to overwrite it");
+REXCVAR_DEFINE_BOOL(gta4_native_defer_resolve_clears, true, "GTA IV/Graphics/Native Renderer",
+                    "Fold full-surface resolve clears into subsequent draw scope load ops "
+                    "to eliminate standalone clear render passes and redundant DRAM stores");
 REXCVAR_DEFINE_UINT32(gta4_native_debug_gpu_attribution, 0, "GTA IV/Graphics/Native Renderer",
                       "Measurement only, breaks the image: 1 = scene draws get an empty scissor "
                       "(vertex and state work only), 2 = scene draws bind state but are not issued")
@@ -32159,6 +32162,13 @@ bool Gta4NativeGraphicsSystem::PrepareSurfaceContent(VkCommandBuffer command_buf
   if (surface.is_reflection) {
     return true;
   }
+  if (surface.pending_clear.valid) {
+    // If the surface has a pending full-target clear, its content will be
+    // cleared via loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR when the rendering scope opens.
+    // We must NOT flush it early here (which would create a standalone clear render pass),
+    // and we don't need to materialize prior aliased EDRAM content into it.
+    return true;
+  }
   GuestSurfaceView view{};
   if (!DecodeGuestSurfaceView(descriptor, depth, view)) {
     return false;
@@ -32189,6 +32199,74 @@ bool Gta4NativeGraphicsSystem::PrepareSurfaceContent(VkCommandBuffer command_buf
         descriptor.handle, RenderPhaseName(render_phase), owner->serial);
   }
   return materialized;
+}
+
+void Gta4NativeGraphicsSystem::FlushPendingSurfaceClear(VkCommandBuffer command_buffer,
+                                                        NativeSurfaceImage& surface,
+                                                        uint32_t submitted_frame) {
+  if (!surface.pending_clear.valid) {
+    return;
+  }
+  const bool depth =
+      (surface.pending_clear.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
+  const VkImageLayout attachment_layout = depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                                                : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  auto* vulkan_provider = static_cast<ui::vulkan::VulkanProvider*>(provider_.get());
+  const auto& dfn = vulkan_provider->vulkan_device()->functions();
+  if (surface.layout != attachment_layout) {
+    const NativeImageLayoutSynchronization surface_synchronization =
+        ImageLayoutSynchronization(surface.layout, surface.aspect);
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.srcAccessMask = surface_synchronization.access;
+    barrier.dstAccessMask =
+        depth ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+              : VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    barrier.oldLayout = surface.layout;
+    barrier.newLayout = attachment_layout;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = surface.resource.image;
+    barrier.subresourceRange =
+        ui::vulkan::util::InitializeSubresourceRange(surface.aspect, 0, 1, 0, 1);
+    profile::CpuCall(profile::CpuOp::kDriverBarrier, [&] {
+      return (++g_barrier_sites[__LINE__], dfn.vkCmdPipelineBarrier)(
+          command_buffer, surface_synchronization.stages,
+          depth ? VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                      VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+                : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+          0, 0, nullptr, 0, nullptr, 1, &barrier);
+    });
+    surface.layout = attachment_layout;
+  }
+
+  VkRenderingAttachmentInfo attachment{};
+  attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+  attachment.imageView = surface.resource.view;
+  attachment.imageLayout = attachment_layout;
+  attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  attachment.clearValue = surface.pending_clear.value;
+  attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+  VkRenderingInfo rendering_info{};
+  rendering_info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+  rendering_info.renderArea.extent = {surface.width, surface.height};
+  rendering_info.layerCount = 1;
+  VkRenderingAttachmentInfo stencil_attachment = attachment;
+  SetNativeRenderingAttachmentBindings(rendering_info, surface.aspect, attachment,
+                                       stencil_attachment);
+  gpu_labels::BeginRendering(vulkan_provider->vulkan_device(), command_buffer, rendering_info,
+                             __func__, diagnostic_submitted_frame_, diagnostic_command_index_);
+  NoteRenderingScope(rendering_info, 7);
+  profile::CpuCall(profile::CpuOp::kDriverRendering,
+                   [&] { return dfn.vkCmdBeginRendering(command_buffer, &rendering_info); });
+  profile::CpuCall(profile::CpuOp::kDriverRendering,
+                   [&] { return dfn.vkCmdEndRendering(command_buffer); });
+  gpu_labels::End(vulkan_provider->vulkan_device(), command_buffer);
+
+  surface.pending_clear.valid = false;
+  surface.pending_clear.aspects = 0;
 }
 
 bool Gta4NativeGraphicsSystem::RecordResolveClears(VkCommandBuffer command_buffer,
@@ -32305,6 +32383,44 @@ bool Gta4NativeGraphicsSystem::RecordResolveClears(VkCommandBuffer command_buffe
       return false;
     }
 
+    VkClearAttachment clear_attachment{};
+    if (depth) {
+      clear_attachment.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+      if (surface->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) {
+        clear_attachment.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+      }
+      clear_attachment.clearValue.depthStencil.depth =
+          float(std::bit_cast<double>(resolve.clear_depth_bits));
+      clear_attachment.clearValue.depthStencil.stencil = resolve.clear_stencil;
+    } else {
+      clear_attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+      for (uint32_t component = 0; component < 4; ++component) {
+        clear_attachment.clearValue.color.float32[component] =
+            std::bit_cast<float>(resolve.clear_color_bits[component]);
+      }
+    }
+
+    if (REXCVAR_GET(gta4_native_defer_resolve_clears) && !primary_plan.explicit_clear &&
+        (!depth || !stencil_plan.explicit_clear)) {
+      surface->pending_clear.valid = true;
+      surface->pending_clear.value = clear_attachment.clearValue;
+      surface->pending_clear.aspects |= clear_attachment.aspectMask;
+      ClaimSurfaceContent(*surface, descriptor, depth, submitted_frame, command.render_phase,
+                          NativePlacementOwner::WriteKind::kResolveClear, clear_attachment.aspectMask);
+      if (NativeRendererEventTraceEnabled()) {
+        TraceNativeRendererEvent(
+            "resolve-clear-deferred",
+            fmt::format("handle={:08X} placement={} depth={} rect={},{},{},{} clear={:08X},{:08X},"
+                        "{:08X},{:08X}:{:016X}:{} origin={} caller={:08X} owner={:08X}",
+                        descriptor.handle, descriptor.address & 0x7FFu, depth, logical_left,
+                        logical_top, logical_right, logical_bottom, resolve.clear_color_bits[0],
+                        resolve.clear_color_bits[1], resolve.clear_color_bits[2],
+                        resolve.clear_color_bits[3], resolve.clear_depth_bits, resolve.clear_stencil,
+                        resolve.trace_origin, resolve.trace_caller, resolve.trace_owner));
+      }
+      return true;
+    }
+
     auto* vulkan_provider = static_cast<ui::vulkan::VulkanProvider*>(provider_.get());
     const auto& dfn = vulkan_provider->vulkan_device()->functions();
     const VkImageLayout attachment_layout = depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
@@ -32332,23 +32448,6 @@ bool Gta4NativeGraphicsSystem::RecordResolveClears(VkCommandBuffer command_buffe
                                      : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                                0, 0, nullptr, 0, nullptr, 1, &barrier); });
       surface->layout = attachment_layout;
-    }
-
-    VkClearAttachment clear_attachment{};
-    if (depth) {
-      clear_attachment.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-      if (surface->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) {
-        clear_attachment.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
-      }
-      clear_attachment.clearValue.depthStencil.depth =
-          float(std::bit_cast<double>(resolve.clear_depth_bits));
-      clear_attachment.clearValue.depthStencil.stencil = resolve.clear_stencil;
-    } else {
-      clear_attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-      for (uint32_t component = 0; component < 4; ++component) {
-        clear_attachment.clearValue.color.float32[component] =
-            std::bit_cast<float>(resolve.clear_color_bits[component]);
-      }
     }
 
     VkRenderingAttachmentInfo attachment{};
@@ -32620,6 +32719,9 @@ bool Gta4NativeGraphicsSystem::RecordResolve(VkCommandBuffer command_buffer,
     content_view = placement_owner->view;
   }
   if (content_source) {
+    if (content_source->pending_clear.valid) {
+      FlushPendingSurfaceClear(command_buffer, *content_source, submitted_frame);
+    }
     MarkNativeSurfaceImageUsed(*content_source);
     TraceBulbResolve(command_buffer, command, content_source, destination, "before", "selected-content-source");
   }
@@ -39801,10 +39903,20 @@ const bool keeps_draw_state =
                 surface ? surface->descriptor.handle : 0, target.width, target.height);
           }
         }
-        attachment.loadOp = !attachment.imageView ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
-                            : initialized         ? VK_ATTACHMENT_LOAD_OP_LOAD
-                                                  : VK_ATTACHMENT_LOAD_OP_CLEAR;
-        attachment.clearValue.color.float32[3] = 1.0f;
+        if (surface && surface->pending_clear.valid &&
+            (surface->pending_clear.aspects & VK_IMAGE_ASPECT_COLOR_BIT)) {
+          attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+          attachment.clearValue = surface->pending_clear.value;
+          surface->pending_clear.aspects &= ~VK_IMAGE_ASPECT_COLOR_BIT;
+          if (!surface->pending_clear.aspects) {
+            surface->pending_clear.valid = false;
+          }
+        } else {
+          attachment.loadOp = !attachment.imageView ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
+                              : initialized         ? VK_ATTACHMENT_LOAD_OP_LOAD
+                                                    : VK_ATTACHMENT_LOAD_OP_CLEAR;
+          attachment.clearValue.color.float32[3] = 1.0f;
+        }
         if (attachment.imageView) {
           if (NativeRendererEventTraceEnabled()) {
           TraceNativeRendererEvent(
@@ -39845,15 +39957,45 @@ const bool keeps_draw_state =
             *target.depth_surface, command.pipeline_state->depth_stencil, true, submitted_frame);
         const bool depth_initialized = placement_current &&
             target.depth_surface->aspect_content.Has(VK_IMAGE_ASPECT_DEPTH_BIT);
-        depth_attachment.loadOp =
-            depth_initialized ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
-        depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        depth_attachment.clearValue.depthStencil.depth = 1.0f;
-        stencil_attachment = depth_attachment;
         const bool stencil_initialized = placement_current &&
             target.depth_surface->aspect_content.Has(VK_IMAGE_ASPECT_STENCIL_BIT);
-        stencil_attachment.loadOp =
-            stencil_initialized ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+        depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        if (target.depth_surface->pending_clear.valid &&
+            (target.depth_surface->pending_clear.aspects &
+             (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))) {
+          if (target.depth_surface->pending_clear.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
+            depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            depth_attachment.clearValue.depthStencil.depth =
+                target.depth_surface->pending_clear.value.depthStencil.depth;
+            target.depth_surface->pending_clear.aspects &= ~VK_IMAGE_ASPECT_DEPTH_BIT;
+          } else {
+            depth_attachment.loadOp =
+                depth_initialized ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+            depth_attachment.clearValue.depthStencil.depth = 1.0f;
+          }
+          stencil_attachment = depth_attachment;
+          if (target.depth_surface->pending_clear.aspects & VK_IMAGE_ASPECT_STENCIL_BIT) {
+            stencil_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            stencil_attachment.clearValue.depthStencil.stencil =
+                target.depth_surface->pending_clear.value.depthStencil.stencil;
+            target.depth_surface->pending_clear.aspects &= ~VK_IMAGE_ASPECT_STENCIL_BIT;
+          } else {
+            stencil_attachment.loadOp =
+                stencil_initialized ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+            stencil_attachment.clearValue.depthStencil.stencil = 0;
+          }
+          if (!target.depth_surface->pending_clear.aspects) {
+            target.depth_surface->pending_clear.valid = false;
+          }
+        } else {
+          depth_attachment.loadOp =
+              depth_initialized ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+          depth_attachment.clearValue.depthStencil.depth = 1.0f;
+          stencil_attachment = depth_attachment;
+          stencil_attachment.loadOp =
+              stencil_initialized ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+          stencil_attachment.clearValue.depthStencil.stencil = 0;
+        }
         if (NativeRendererEventTraceEnabled()) {
         TraceNativeRendererEvent(
             "depth-attachment",
@@ -41726,6 +41868,11 @@ const bool keeps_draw_state =
   TraceArtificialLightActivity(submitted_frame, artificial_light_renderer_instances);
   if (rendering) {
     end_rendering(__LINE__);
+  }
+  for (const auto& image : native_surface_images_) {
+    if (image && image->pending_clear.valid) {
+      FlushPendingSurfaceClear(command_buffer, *image, submitted_frame);
+    }
   }
   tv_frame_trace_.reset();
   if (tv_content_probe_buffer_.buffer && tv_content_probe_buffer_.pending_frame) {
