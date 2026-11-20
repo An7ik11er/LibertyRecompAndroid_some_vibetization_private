@@ -424,7 +424,7 @@ REXCVAR_DEFINE_BOOL(gta4_native_resolve_swap, false, "GTA IV/Graphics/Native Ren
 REXCVAR_DEFINE_BOOL(gta4_native_present_from_surface, true, "GTA IV/Graphics/Native Renderer",
                     "Present the frame's final surface directly instead of first resolving it into "
                     "the RGBA8 frontbuffer when nothing else reads that frontbuffer");
-REXCVAR_DEFINE_BOOL(gta4_native_lazy_resolves, false, "GTA IV/Graphics/Native Renderer",
+REXCVAR_DEFINE_BOOL(gta4_native_lazy_resolves, true, "GTA IV/Graphics/Native Renderer",
                     "Skip resolves into textures that no draw, post-processing pass, present or "
                     "CPU readback has used for 120 frames; the first use in a later frame sees "
                     "one stale frame");
@@ -6506,7 +6506,7 @@ void Gta4NativeGraphicsSystem::ForgetBufferCapture(uint32_t handle) {
 
 bool Gta4NativeGraphicsSystem::CaptureBufferResourceIntoEpoch(
     uint32_t handle, uint64_t clear_epoch, uint32_t current_frame, NativeCommand& command,
-    std::shared_ptr<const NativeBufferResource>& out) {
+    const NativeBufferResource*& out) {
   if (!handle) [[unlikely]] return false;
 
   const uint32_t current_serial = capture_keepalive_serial_;
@@ -6575,8 +6575,7 @@ bool Gta4NativeGraphicsSystem::CaptureBufferResourceIntoEpoch(
               matched->raw->last_used_frame.store(current_frame, std::memory_order_relaxed);
             }
           }
-          out = std::shared_ptr<const NativeBufferResource>(
-              std::shared_ptr<const NativeBufferResource>{}, matched->raw);
+          out = matched->raw;
           return true;
         }
       }
@@ -6587,7 +6586,7 @@ bool Gta4NativeGraphicsSystem::CaptureBufferResourceIntoEpoch(
 
 bool Gta4NativeGraphicsSystem::CaptureBufferResourceIntoSlow(
     uint32_t handle, uint64_t clear_epoch, uint32_t current_frame, NativeCommand& command,
-    std::shared_ptr<const NativeBufferResource>& out) {
+    const NativeBufferResource*& out) {
   const uint32_t current_serial = capture_keepalive_serial_;
   static const bool use_keepalive = REXCVAR_GET(gta4_native_capture_keepalive);
 
@@ -6641,25 +6640,50 @@ bool Gta4NativeGraphicsSystem::CaptureBufferResourceIntoSlow(
               SelectBufferL1Slot(BufferL1SetBase(handle), handle, capture_keepalive_serial_);
           l1_slot = {handle, capture_keepalive_serial_, raw_flags, raw_addr_word, raw_size_word,
                      current_frame, object, raw};
-          out = std::shared_ptr<const NativeBufferResource>(
-              std::shared_ptr<const NativeBufferResource>{}, raw);
+          out = raw;
           return true;
         }
         // L1 and L2 both missed; skip re-checking them in CaptureBufferResource.
-        out = CaptureBufferResourceSlotSlow(handle, clear_epoch, current_frame, true, object,
-                                            raw_flags, raw_addr_word, raw_size_word, flags,
-                                            data_address, data_size, false);
-        return bool(out);
+        auto res = CaptureBufferResourceSlotSlow(handle, clear_epoch, current_frame, true, object,
+                                                 raw_flags, raw_addr_word, raw_size_word, flags,
+                                                 data_address, data_size, false);
+        if (!res) return false;
+        out = res.get();
+        if (capture_keepalive_) {
+          if (capture_keepalive_->refs.size() >= kCaptureKeepAliveLimit) {
+            RollCaptureKeepAlive();
+          }
+          if (res->keepalive_serial != capture_keepalive_serial_) {
+            res->keepalive_serial = capture_keepalive_serial_;
+            capture_keepalive_->refs.push_back(std::move(res));
+          }
+        } else {
+          command.EnsureExtras().owned_buffers.push_back(std::move(res));
+        }
+        return true;
       }
     }
   }
 
-  out = CaptureBufferResource(handle);
-  return bool(out);
+  auto res = CaptureBufferResource(handle);
+  if (!res) return false;
+  out = res.get();
+  if (capture_keepalive_) {
+    if (capture_keepalive_->refs.size() >= kCaptureKeepAliveLimit) {
+      RollCaptureKeepAlive();
+    }
+    if (res->keepalive_serial != capture_keepalive_serial_) {
+      res->keepalive_serial = capture_keepalive_serial_;
+      capture_keepalive_->refs.push_back(std::move(res));
+    }
+  } else {
+    command.EnsureExtras().owned_buffers.push_back(std::move(res));
+  }
+  return true;
 }
 
 bool Gta4NativeGraphicsSystem::CaptureBufferResourceInto(
-    uint32_t handle, NativeCommand& command, std::shared_ptr<const NativeBufferResource>& out) {
+    uint32_t handle, NativeCommand& command, const NativeBufferResource*& out) {
   if (!handle) [[unlikely]] return false;
   return CaptureBufferResourceIntoEpoch(
       handle, SyncBufferCaptureTables(),
@@ -11736,7 +11760,7 @@ Gta4NativeGraphicsSystem::NativePersistentBufferEntry* Gta4NativeGraphicsSystem:
 }
 
 bool Gta4NativeGraphicsSystem::GetOrCreatePersistentBuffer(
-    VkCommandBuffer command_buffer, const std::shared_ptr<const NativeBufferResource>& owner,
+    VkCommandBuffer command_buffer, const NativeBufferResource* owner,
     const NativePersistentBufferKey& key, const uint8_t* source, VkDeviceSize size,
     NativeUploadKind upload_kind, NativeUploadAllocation& allocation) {
   const profile::CpuScope profile_scope(profile::CpuOp::kPersistentBuffer);
@@ -20346,7 +20370,7 @@ bool Gta4NativeGraphicsSystem::EnsureFrameUploadCapacity(
       if (!resource || resource->payload.empty() || !stream_state.stride) {
         continue;
       }
-      VertexUploadKey key{resource.get(), declaration_hash,    shader_hash,
+      VertexUploadKey key{resource,       declaration_hash,    shader_hash,
                           stream,         stream_state.offset, stream_state.stride};
       if (pending_vertex_uploads.insert(key).second) {
         NativePersistentBufferKey persistent_key{};
@@ -20367,7 +20391,7 @@ bool Gta4NativeGraphicsSystem::EnsureFrameUploadCapacity(
     if (command.type == CommandType::kDrawIndexedPrimitive && command.index_buffer) {
       const bool index32 = (command.index_buffer->flags & kIndex32Flag) != 0;
       if (!persistent_direct_upload &&
-          pending_index_uploads.insert({command.index_buffer.get(), index32}).second) {
+          pending_index_uploads.insert({command.index_buffer, index32}).second) {
         NativePersistentBufferKey persistent_key{};
         persistent_key.generation = command.index_buffer->generation;
         persistent_key.kind =
@@ -20595,7 +20619,7 @@ bool Gta4NativeGraphicsSystem::EnsureFrameUploadCapacityFast(
       if (!resource || resource->payload.empty() || !stream_state.stride) {
         continue;
       }
-      const CapacityVertexKey key{resource.get(), declaration_hash,    shader_hash,
+      const CapacityVertexKey key{resource,       declaration_hash,    shader_hash,
                                   stream,         stream_state.offset, stream_state.stride};
       if (pending_vertex_uploads.Insert(key)) {
         NativePersistentBufferKey persistent_key{};
@@ -20616,7 +20640,7 @@ bool Gta4NativeGraphicsSystem::EnsureFrameUploadCapacityFast(
     if (command.type == CommandType::kDrawIndexedPrimitive && command.index_buffer) {
       const bool index32 = (command.index_buffer->flags & kIndex32Flag) != 0;
       if (!persistent_direct_upload &&
-          pending_index_uploads.Insert(CapacityIndexKey{command.index_buffer.get(), index32})) {
+          pending_index_uploads.Insert(CapacityIndexKey{command.index_buffer, index32})) {
         NativePersistentBufferKey persistent_key{};
         persistent_key.generation = command.index_buffer->generation;
         persistent_key.kind =
@@ -23326,6 +23350,12 @@ Gta4NativeGraphicsSystem::CaptureKeepAlive::~CaptureKeepAlive() {
 void Gta4NativeGraphicsSystem::RollCaptureKeepAlive() {
   const size_t previous = capture_keepalive_ ? capture_keepalive_->refs.size() : 0;
   if (capture_keepalive_) {
+    if (!staged_draw_commands_.empty()) {
+      staged_draw_commands_.back()->HoldCaptureKeepAlive(capture_keepalive_);
+    }
+    if (active_capture_command_) {
+      active_capture_command_->HoldCaptureKeepAlive(capture_keepalive_);
+    }
     retired_capture_keepalives_.push_back(std::move(capture_keepalive_));
   }
   std::shared_ptr<CaptureKeepAlive> next;
@@ -26157,7 +26187,7 @@ VkPipeline Gta4NativeGraphicsSystem::GetOrCreatePipeline(
 }
 
 bool Gta4NativeGraphicsSystem::UploadBufferResource(
-    const std::shared_ptr<const NativeBufferResource>& resource, VkCommandBuffer command_buffer,
+    const NativeBufferResource* resource, VkCommandBuffer command_buffer,
     bool index_buffer, bool index32, const NativePipelineState* vertex_state,
     uint32_t vertex_stream, NativeFrameResources& resources, NativeUploadAllocation& allocation) {
   const profile::CpuScope profile_scope(profile::CpuOp::kBufferUpload);
@@ -26192,7 +26222,7 @@ bool Gta4NativeGraphicsSystem::UploadBufferResource(
           submission_tracker_ ? submission_tracker_->GetCurrentSubmission() : 0;
       const bool flight_enabled = IsNativeFlightRecorderEnabled();
       const auto& ib_memo = resources.last_ib_upload;
-      if (ib_memo.resource == resource.get() && ib_memo.generation == resource->generation &&
+      if (ib_memo.resource == resource && ib_memo.generation == resource->generation &&
           ib_memo.index32 == index32 && ib_memo.frame == active_texture_frame_ &&
           ib_memo.persistent_epoch == persistent_buffer_epoch_ && ib_memo.persistent_entry) [[likely]] {
         if (ib_memo.persistent_entry->last_used_frame != active_texture_frame_ ||
@@ -26223,7 +26253,7 @@ bool Gta4NativeGraphicsSystem::UploadBufferResource(
           allocation.offset = resource->cached_index32_entry->offset;
           allocation.host_data = host_payload.data();
           resources.last_ib_upload = {
-              resource.get(),         resource->generation,    true,
+              resource,               resource->generation,    true,
               active_texture_frame_,  persistent_buffer_epoch_,
               resource->cached_index32_entry, allocation};
           return true;
@@ -26245,7 +26275,7 @@ bool Gta4NativeGraphicsSystem::UploadBufferResource(
           allocation.offset = resource->cached_index16_entry->offset;
           allocation.host_data = host_payload.data();
           resources.last_ib_upload = {
-              resource.get(),         resource->generation,    false,
+              resource,               resource->generation,    false,
               active_texture_frame_,  persistent_buffer_epoch_,
               resource->cached_index16_entry, allocation};
           return true;
@@ -26272,7 +26302,7 @@ bool Gta4NativeGraphicsSystem::UploadBufferResource(
           resource->cached_index16_epoch = persistent_buffer_epoch_;
         }
         resources.last_ib_upload = {
-            resource.get(),         resource->generation,    index32,
+            resource,               resource->generation,    index32,
             active_texture_frame_,  persistent_buffer_epoch_, entry,
             allocation};
         return true;
@@ -26327,7 +26357,7 @@ bool Gta4NativeGraphicsSystem::UploadBufferResource(
 
   if (memo_first) {
     const auto& vb_memo = resources.last_vb_uploads[vertex_stream];
-    if (vb_memo.resource == resource.get() && vb_memo.generation == resource->generation &&
+    if (vb_memo.resource == resource && vb_memo.generation == resource->generation &&
         vb_memo.declaration_hash == declaration.content_hash &&
         vb_memo.shader_hash == shader.input_signature_hash &&
         vb_memo.stream_offset == stream_state.offset && vb_memo.stride == stream_state.stride &&
@@ -26372,7 +26402,7 @@ bool Gta4NativeGraphicsSystem::UploadBufferResource(
     allocation.offset = converted_payload->cached_persistent_entry->offset;
     allocation.host_data = converted_payload->payload.data();
     resources.last_vb_uploads[vertex_stream] = {
-        resource.get(),
+        resource,
         resource->generation,
         declaration.content_hash,
         shader.input_signature_hash,
@@ -26409,7 +26439,7 @@ bool Gta4NativeGraphicsSystem::UploadBufferResource(
         mutable_payload->cached_vk_epoch = persistent_buffer_epoch_;
         allocation.host_data = converted_payload->payload.data();
         resources.last_vb_uploads[vertex_stream] = {
-            resource.get(),
+            resource,
             resource->generation,
             declaration.content_hash,
             shader.input_signature_hash,
@@ -28535,10 +28565,10 @@ uint64_t Gta4NativeGraphicsSystem::MemoShadowKey(const NativeCommand& command,
     if (!stream_state.stride && !resource) continue;
     put((uint64_t(stream) << 56) ^ (uint64_t(stream_state.buffer) << 24) ^ stream_state.stride);
     put(stream_state.offset);
-    put(ptr(resource.get()));
+    put(ptr(resource));
     put(resource ? resource->generation : 0);
   }
-  put(ptr(command.index_buffer.get()));
+  put(ptr(command.index_buffer));
   put(command.index_buffer ? command.index_buffer->generation : 0);
   put(command.index_buffer ? command.index_buffer->flags : 0);
   // Texture resources: the signature has their pointers and fetches; add the generations.
@@ -35874,7 +35904,10 @@ NativeFrameTask Gta4NativeGraphicsSystem::RecordNativeFrameTask(
     // readers, and A3 checks the present source separately.
     if (lazy_resolves) {
       for (const NativeCommand& scan : (*recording_frame_)) {
-        for (const auto& texture : scan.textures) mark_input(texture);
+        for (uint32_t mask = scan.used_texture_mask; mask; mask &= mask - 1) {
+          const uint32_t stage = uint32_t(std::countr_zero(mask));
+          if (stage < scan.textures.size()) mark_input(scan.textures[stage]);
+        }
         if (const auto* ex = scan.extras.get()) {
           mark_input(ex->postfx_half_scene);
           mark_input(ex->depth_handoff_source);
@@ -35890,16 +35923,22 @@ NativeFrameTask Gta4NativeGraphicsSystem::RecordNativeFrameTask(
         // A later frame's stamp only makes this conservative (an extra resolve).
         read = std::atomic_ref(frontbuffer->assembly_read_epoch).load(std::memory_order_relaxed) >=
                frame_constant_bound_.read_epoch;
-      } else for (const NativeCommand& scan : (*recording_frame_)) {
-        for (const auto& texture : scan.textures) {
-          read |= texture && (texture.get() == frontbuffer ||
-                              texture->packed_depth_source.get() == frontbuffer);
+      } else {
+        for (const NativeCommand& scan : (*recording_frame_)) {
+          for (uint32_t mask = scan.used_texture_mask; mask; mask &= mask - 1) {
+            const uint32_t stage = uint32_t(std::countr_zero(mask));
+            if (stage < scan.textures.size()) {
+              const auto& texture = scan.textures[stage];
+              read |= texture && (texture.get() == frontbuffer ||
+                                  texture->packed_depth_source.get() == frontbuffer);
+            }
+          }
+          if (const auto* ex = scan.extras.get()) {
+            read |= ex->postfx_half_scene.get() == frontbuffer ||
+                    ex->depth_handoff_source.get() == frontbuffer;
+          }
+          if (read) break;
         }
-        if (const auto* ex = scan.extras.get()) {
-          read |= ex->postfx_half_scene.get() == frontbuffer ||
-                  ex->depth_handoff_source.get() == frontbuffer;
-        }
-        if (read) break;
       }
       if (read) texture_input_frames_[present_source->generation] = submitted_frame;
     }

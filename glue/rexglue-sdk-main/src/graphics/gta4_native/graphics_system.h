@@ -857,21 +857,21 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
       if (device_snapshot.storage) device_snapshot.storage.reset();
       if (shader_state) shader_state.reset();
       if (pipeline_state) pipeline_state.reset();
-      if (index_buffer) index_buffer.reset();
+      index_buffer = nullptr;
       if (phone_trace) phone_trace.reset();
       if (resolve_destination) resolve_destination.reset();
       if (present_source) present_source.reset();
 
       for (uint32_t mask = stream_mask; mask; mask &= mask - 1) {
         const uint32_t stream = uint32_t(std::countr_zero(mask));
-        if (stream < vertex_buffers.size()) vertex_buffers[stream].reset();
+        if (stream < vertex_buffers.size()) vertex_buffers[stream] = nullptr;
       }
       for (uint32_t mask = texture_mask; mask; mask &= mask - 1) {
         const uint32_t stage = uint32_t(std::countr_zero(mask));
         if (stage < textures.size()) textures[stage].reset();
       }
 #ifndef NDEBUG
-      for (auto& vb : vertex_buffers) if (vb) vb.reset();
+      vertex_buffers.fill(nullptr);
       for (auto& tex : textures) if (tex) tex.reset();
 #endif
       if (extras) [[unlikely]] extras.reset();
@@ -1072,7 +1072,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     // Owned references. Typical draws: the first four.
     std::shared_ptr<const NativeShaderState> shader_state;
     NativeCommandPipelineState pipeline_state;  // 66: in the command, see the class
-    std::shared_ptr<const NativeBufferResource> index_buffer;
+    const NativeBufferResource* index_buffer = nullptr;
     std::shared_ptr<CaptureKeepAlive> capture_keepalive;
     std::shared_ptr<SnapshotKeepAlive> snapshot_keepalive;
     static constexpr uint32_t kProtectedGenerationCapacity = 14;
@@ -1089,6 +1089,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
       std::shared_ptr<const NativeFixedFunctionState> fixed_owner;
       std::shared_ptr<std::vector<NativeRoomLightInputBinding>> room_light_input_bindings;
       std::vector<std::shared_ptr<CaptureKeepAlive>> extra_capture_keepalives;
+      std::vector<std::shared_ptr<const NativeBufferResource>> owned_buffers;
       mutable std::array<uint64_t, kProtectedGenerationCapacity> protected_generations{};
     };
     template <typename T>
@@ -1143,7 +1144,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     std::array<uint32_t, kTextureStageCount> texture_descriptor_indices{};
     std::array<uint32_t, kTextureStageCount> sampler_descriptor_indices{};
     // Read per used stream / stage only.
-    std::array<std::shared_ptr<const NativeBufferResource>, kVertexStreamCount> vertex_buffers{};
+    std::array<const NativeBufferResource*, kVertexStreamCount> vertex_buffers{};
     std::array<std::shared_ptr<const NativeTextureResource>, kTextureStageCount> textures{};
     std::array<NativeBindingRealization, kTextureStageCount> binding_realization{};
     std::array<xenos::xe_gpu_texture_fetch_t, kTextureStageCount> texture_fetches{};
@@ -2147,12 +2148,12 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   uint64_t SyncBufferCaptureTables();
   bool CaptureBufferResourceIntoEpoch(uint32_t handle, uint64_t clear_epoch, uint32_t current_frame,
                                       NativeCommand& command,
-                                      std::shared_ptr<const NativeBufferResource>& out);
+                                      const NativeBufferResource*& out);
   [[gnu::noinline]] bool CaptureBufferResourceIntoSlow(
       uint32_t handle, uint64_t clear_epoch, uint32_t current_frame, NativeCommand& command,
-      std::shared_ptr<const NativeBufferResource>& out);
+      const NativeBufferResource*& out);
   bool CaptureBufferResourceInto(uint32_t handle, NativeCommand& command,
-                                 std::shared_ptr<const NativeBufferResource>& out);
+                                 const NativeBufferResource*& out);
   SurfaceDescriptor CaptureSurfaceDescriptor(uint32_t handle) const;
   std::shared_ptr<const NativeTextureResource> CaptureTextureResource(
       uint32_t handle, const xenos::xe_gpu_texture_fetch_t& fetch, uint32_t stage);
@@ -2620,7 +2621,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   void TryPrewarmDrawPipeline(const NativeCommand& command);
   bool GetRequiredVertexStreams(const NativePipelineState& state,
                                 std::array<bool, kVertexStreamCount>& required_streams) const;
-  bool UploadBufferResource(const std::shared_ptr<const NativeBufferResource>& resource,
+  bool UploadBufferResource(const NativeBufferResource* resource,
                             VkCommandBuffer command_buffer, bool index_buffer, bool index32,
                             const NativePipelineState* vertex_state, uint32_t vertex_stream,
                             NativeFrameResources& resources, NativeUploadAllocation& allocation);
@@ -2650,7 +2651,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     }
   }
   bool GetOrCreatePersistentBuffer(VkCommandBuffer command_buffer,
-                                   const std::shared_ptr<const NativeBufferResource>& owner,
+                                   const NativeBufferResource* owner,
                                    const NativePersistentBufferKey& key, const uint8_t* source,
                                    VkDeviceSize size, NativeUploadKind upload_kind,
                                    NativeUploadAllocation& allocation);

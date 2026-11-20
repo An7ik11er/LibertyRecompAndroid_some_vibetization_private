@@ -36,14 +36,46 @@ constexpr Fsr1RenderExtent SelectFsr1RenderExtent(uint32_t display_width, uint32
   const auto divide = [&](uint32_t value) {
     return uint32_t((uint64_t(value) * scale->denominator + scale->numerator / 2) / scale->numerator);
   };
-  const uint32_t width = divide(display_width), height = divide(display_height);
-  // Preserve the title's validated minimum scene size, not just the API limit.
+  uint32_t width = divide(display_width), height = divide(display_height);
+  // Preserve the title's validated minimum scene size (640x360), not just the API limit.
   if (width < 640 || height < 360) {
-    result.selection = Fsr1Selection::kBelowRenderFloor; return result;
+    if (display_width <= 640 || display_height <= 360) {
+      result.selection = Fsr1Selection::kBelowRenderFloor;
+      return result;
+    }
+    // Scale up to the 640x360 floor while preserving display aspect ratio.
+    if (uint64_t(360) * display_width >= uint64_t(640) * display_height) {
+      height = 360;
+      width = uint32_t((uint64_t(360) * display_width + display_height / 2) / display_height);
+    } else {
+      width = 640;
+      height = uint32_t((uint64_t(640) * display_height + display_width / 2) / display_width);
+    }
+    // Round to even dimensions >= floor
+    width = (width + 1) & ~1u;
+    height = (height + 1) & ~1u;
+    if (width < 640) width = 640;
+    if (height < 360) height = 360;
+    if (width >= display_width || height >= display_height) {
+      result.selection = Fsr1Selection::kBelowRenderFloor;
+      return result;
+    }
   }
   result.width = width; result.height = height; result.selection = Fsr1Selection::kEnabled;
   return result;
 }
+
+// Compile-time verification of FSR1 extent policy & aspect ratio floor preservation
+static_assert(SelectFsr1RenderExtent(1280, 576, true, "performance", false, false, true).width == 800);
+static_assert(SelectFsr1RenderExtent(1280, 576, true, "performance", false, false, true).height == 360);
+static_assert(SelectFsr1RenderExtent(1280, 576, true, "performance", false, false, true).selection == Fsr1Selection::kEnabled);
+static_assert(SelectFsr1RenderExtent(1280, 576, true, "balanced", false, false, true).width == 800);
+static_assert(SelectFsr1RenderExtent(1280, 576, true, "balanced", false, false, true).height == 360);
+static_assert(SelectFsr1RenderExtent(1280, 576, true, "balanced", false, false, true).selection == Fsr1Selection::kEnabled);
+static_assert(SelectFsr1RenderExtent(640, 360, true, "performance", false, false, true).selection == Fsr1Selection::kBelowRenderFloor);
+static_assert(!SelectFsr1RenderExtent(640, 360, true, "performance", false, false, true).active());
+static_assert(!SelectFsr1RenderExtent(0, 0, true, "quality", false, false, true).active());
+
 // Application quality presets, not fixed MetalFX API modes. MetalFX accepts
 // continuous input/output ratios. Keep the same four menu quality ratios and
 // the title's validated render floor for predictable switching between scalers.
