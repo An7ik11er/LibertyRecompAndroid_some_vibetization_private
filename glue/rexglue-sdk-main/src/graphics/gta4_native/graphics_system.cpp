@@ -334,7 +334,7 @@ REXCVAR_DEFINE_BOOL(gta4_native_resolve_kind_report, false, "GTA IV/Diagnostics"
 REXCVAR_DEFINE_BOOL(gta4_native_materialize_by_copy, true, "GTA IV/Graphics/Native Renderer",
                     "Materialize a surface view of the same format, size and samples with an "
                     "image copy instead of a conversion pass");
-REXCVAR_DEFINE_BOOL(gta4_native_worker_constant_ring, false, "GTA IV/Graphics/Native Renderer",
+REXCVAR_DEFINE_BOOL(gta4_native_worker_constant_ring, true, "GTA IV/Graphics/Native Renderer",
                     "The render worker writes each draw's shader constants into a per-frame "
                     "ring while assembling the frame; the recorder only binds their addresses");
 REXCVAR_DEFINE_BOOL(gta4_native_worker_constant_ring_validate, false, "GTA IV/Diagnostics",
@@ -6647,21 +6647,27 @@ bool Gta4NativeGraphicsSystem::CaptureBufferResourceIntoSlow(
           return true;
         }
         // L1 and L2 both missed; skip re-checking them in CaptureBufferResource.
-        auto res = CaptureBufferResourceSlotSlow(handle, clear_epoch, current_frame, true, object,
+        auto res = CaptureBufferResourceSlotSlow(handle, clear_epoch, current_frame, use_keepalive, object,
                                                  raw_flags, raw_addr_word, raw_size_word, flags,
                                                  data_address, data_size, false);
         if (!res) return false;
         out = res.get();
-        if (capture_keepalive_) {
-          if (capture_keepalive_->refs.size() >= kCaptureKeepAliveLimit) {
-            RollCaptureKeepAlive();
-          }
-          if (res->keepalive_serial != capture_keepalive_serial_) {
-            res->keepalive_serial = capture_keepalive_serial_;
-            capture_keepalive_->refs.push_back(std::move(res));
+        if (res.use_count() > 0) {
+          if (capture_keepalive_) {
+            if (capture_keepalive_->refs.size() >= kCaptureKeepAliveLimit) {
+              RollCaptureKeepAlive();
+            }
+            if (res->keepalive_serial != capture_keepalive_serial_) {
+              res->keepalive_serial = capture_keepalive_serial_;
+              capture_keepalive_->refs.push_back(std::move(res));
+            }
+          } else {
+            command.EnsureExtras().owned_buffers.push_back(std::move(res));
           }
         } else {
-          command.EnsureExtras().owned_buffers.push_back(std::move(res));
+          if (capture_keepalive_) {
+            command.HoldCaptureKeepAlive(capture_keepalive_);
+          }
         }
         return true;
       }
@@ -6671,16 +6677,22 @@ bool Gta4NativeGraphicsSystem::CaptureBufferResourceIntoSlow(
   auto res = CaptureBufferResource(handle);
   if (!res) return false;
   out = res.get();
-  if (capture_keepalive_) {
-    if (capture_keepalive_->refs.size() >= kCaptureKeepAliveLimit) {
-      RollCaptureKeepAlive();
-    }
-    if (res->keepalive_serial != capture_keepalive_serial_) {
-      res->keepalive_serial = capture_keepalive_serial_;
-      capture_keepalive_->refs.push_back(std::move(res));
+  if (res.use_count() > 0) {
+    if (capture_keepalive_) {
+      if (capture_keepalive_->refs.size() >= kCaptureKeepAliveLimit) {
+        RollCaptureKeepAlive();
+      }
+      if (res->keepalive_serial != capture_keepalive_serial_) {
+        res->keepalive_serial = capture_keepalive_serial_;
+        capture_keepalive_->refs.push_back(std::move(res));
+      }
+    } else {
+      command.EnsureExtras().owned_buffers.push_back(std::move(res));
     }
   } else {
-    command.EnsureExtras().owned_buffers.push_back(std::move(res));
+    if (capture_keepalive_) {
+      command.HoldCaptureKeepAlive(capture_keepalive_);
+    }
   }
   return true;
 }
@@ -31264,6 +31276,10 @@ bool Gta4NativeGraphicsSystem::RecordSurfaceMaterialization(
     return false;
   }
 
+  if (source->pending_clear.valid) {
+    FlushPendingSurfaceClear(command_buffer, *source, diagnostic_submitted_frame_);
+  }
+
   if (REXCVAR_GET(gta4_native_resolve_kind_report)) {
     NoteResolveKind(fmt::format("M: {}x{} f{}->{}", destination.width, destination.height,
                                 uint32_t(source->format), uint32_t(destination.format)));
@@ -32241,11 +32257,14 @@ void Gta4NativeGraphicsSystem::FlushPendingSurfaceClear(VkCommandBuffer command_
     surface.layout = attachment_layout;
   }
 
+  const bool clear_depth = (surface.pending_clear.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) != 0;
+  const bool clear_stencil = (surface.pending_clear.aspects & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
+
   VkRenderingAttachmentInfo attachment{};
   attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
   attachment.imageView = surface.resource.view;
   attachment.imageLayout = attachment_layout;
-  attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  attachment.loadOp = (!depth || clear_depth) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
   attachment.clearValue = surface.pending_clear.value;
   attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
 
@@ -32254,6 +32273,7 @@ void Gta4NativeGraphicsSystem::FlushPendingSurfaceClear(VkCommandBuffer command_
   rendering_info.renderArea.extent = {surface.width, surface.height};
   rendering_info.layerCount = 1;
   VkRenderingAttachmentInfo stencil_attachment = attachment;
+  stencil_attachment.loadOp = clear_stencil ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
   SetNativeRenderingAttachmentBindings(rendering_info, surface.aspect, attachment,
                                        stencil_attachment);
   gpu_labels::BeginRendering(vulkan_provider->vulkan_device(), command_buffer, rendering_info,
@@ -32666,6 +32686,9 @@ bool Gta4NativeGraphicsSystem::RecordResolve(VkCommandBuffer command_buffer,
       planned_resolve_swaps_[command.resolve_swap].texture == destination) {
     PlannedResolveSwap& plan = planned_resolve_swaps_[command.resolve_swap];
     NativeSurfaceImage& surface = *plan.surface;
+    if (surface.pending_clear.valid) {
+      FlushPendingSurfaceClear(command_buffer, surface, submitted_frame);
+    }
     const NativePlacementOwner* owner = FindPlacementOwner(resolve.source, false);
     const bool content_ready = source == &surface && (!owner || owner->image == &surface) &&
                                surface.ever_written &&
@@ -37210,7 +37233,9 @@ const bool keeps_draw_state =
             : (frontbuffer->width != frontbuffer->logical_width ||
                surface->logical_width != frontbuffer->logical_width) ? 10
             : (!surface->ever_written || surface->layout == VK_IMAGE_LAYOUT_UNDEFINED) ? 11 : 0;
+        static const bool sgsr_configured = rex::cvar::Query<std::string>("gta4_native_upscaler") == "sgsr";
         const bool eligible =
+            !sgsr_configured &&
             frontbuffer && surface && (!owner || owner->image == surface) && !cpu_read &&
             (other_use == texture_input_frames_.end() || other_use->second + 120 < submitted_frame) &&
             (flags & 7u) != 4u && !(flags & 0x300u) && !resolve.parameters_valid &&
@@ -42336,8 +42361,11 @@ bool Gta4NativeGraphicsSystem::ClearGuestOutput(
     const PresentCommand& present,
     const std::shared_ptr<const NativeTextureResource>& present_source,
     const std::shared_ptr<const EnvironmentalDataV2>& environmental_data) {
-  const uint32_t guest_output_width = width;
-  const uint32_t guest_output_height = height;
+  static const bool sgsr_configured = rex::cvar::Query<std::string>("gta4_native_upscaler") == "sgsr";
+  const bool sgsr_upscale_active = sgsr_configured && !IsNativeSsaaEnabled() &&
+      (display_width > width || display_height > height);
+  const uint32_t guest_output_width = sgsr_upscale_active ? display_width : width;
+  const uint32_t guest_output_height = sgsr_upscale_active ? display_height : height;
 
   // 60: a streamed frame was prepared and recorded while it was assembled: only its tail,
   // the presentation and the submission are left.

@@ -8818,7 +8818,7 @@ extern "C" void sub_82A467D8(PPCContext& ctx, uint8_t* base) {
   // Pacing presentation to 30.0 FPS eliminates the 2:2 pulldown step-hold judder
   // at 60 FPS while keeping 100% smooth pacing. Gameplay automatically runs at full FPS.
   if (REXCVAR_GET(gta4_cutscene_30fps_lock)) {
-    const uint8_t cutscene_active = LoadU8(base, 0x82B977F0u);
+    const uint32_t cutscene_active = LoadU32(base, 0x82B977F0u);
     if (cutscene_active != 0) {
       using PacingClock = std::chrono::steady_clock;
       static std::atomic<uint64_t> s_last_cutscene_present_ns{0};

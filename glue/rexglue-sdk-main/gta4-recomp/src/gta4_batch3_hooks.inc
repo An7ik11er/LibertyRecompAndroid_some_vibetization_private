@@ -323,7 +323,6 @@ inline void OptSub828C8DB0(PPCContext& ctx, uint8_t* base) {
     const uint32_t pair_table = REX_LOAD_U32(pass + 4u);
     const uint32_t type_table = REX_LOAD_U32(shader_data + 16u);
     const uint32_t val_table  = REX_LOAD_U32(shader_data + 0u);
-    const uint32_t effect_base = REX_LOAD_U32(effect_ptr + 0u);
 
     for (uint32_t i = 0u; i < param_count; ++i) {
       const uint16_t pair = REX_LOAD_U16(pair_table + (i << 1));
@@ -333,6 +332,7 @@ inline void OptSub828C8DB0(PPCContext& ctx, uint8_t* base) {
       const uint32_t val = REX_LOAD_U32(val_table + (idx0 << 2));
 
       if (is_const == 0u) {
+        const uint32_t effect_base = REX_LOAD_U32(effect_ptr + 0u);
         const uint32_t desc = effect_base + (idx0 * 48u);
         const uint32_t override_count = static_cast<uint32_t>(REX_LOAD_U8(desc + 2u) >> 1);
         const uint32_t overrides = REX_LOAD_U32(desc + 24u);
@@ -386,7 +386,6 @@ inline void OptSub828C8E80(PPCContext& ctx, uint8_t* base) {
     const uint32_t pair_table = REX_LOAD_U32(pass + 4u);
     const uint32_t type_table = REX_LOAD_U32(shader_data + 16u);
     const uint32_t val_table  = REX_LOAD_U32(shader_data + 0u);
-    const uint32_t effect_base = REX_LOAD_U32(effect_ptr + 0u);
 
     for (uint32_t i = 0u; i < param_count; ++i) {
       const uint16_t pair = REX_LOAD_U16(pair_table + (i << 1));
@@ -396,6 +395,7 @@ inline void OptSub828C8E80(PPCContext& ctx, uint8_t* base) {
       const uint32_t val = REX_LOAD_U32(val_table + (idx0 << 2));
 
       if (is_const == 0u) {
+        const uint32_t effect_base = REX_LOAD_U32(effect_ptr + 0u);
         const uint32_t desc = effect_base + (idx0 * 48u);
         const uint32_t override_count = static_cast<uint32_t>(REX_LOAD_U8(desc + 2u) >> 1);
         const uint32_t overrides = REX_LOAD_U32(desc + 24u);
