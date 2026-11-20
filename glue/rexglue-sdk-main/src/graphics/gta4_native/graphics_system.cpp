@@ -24833,25 +24833,33 @@ bool Gta4NativeGraphicsSystem::ResolveRenderingTarget(const NativeCommand& comma
     target.logical_height = target.height;
     target.samples = VK_SAMPLE_COUNT_1_BIT;
   }
-// ИСПРАВЛЕНИЕ: Если открытый RenderPass уже содержит все нужные нам буферы,
-  // принудительно используем его маску, чтобы не рвать пасс.
+  // If the open RenderPass already owns all requested color buffers (and matching depth/extent),
+  // keep its active color mask to avoid breaking the pass unnecessarily.
   uint32_t final_colors = requested_colors;
-  if (active_target && 
+  if (active_target &&
       (active_target->color_attachment_mask & requested_colors) == requested_colors &&
       active_target->depth_view == target.depth_view &&
       active_target->samples == target.samples &&
       active_target->width == target.width && active_target->height == target.height) {
-      
-      final_colors = active_target->color_attachment_mask;
-      
-      // Копируем недостающие вьюшки и форматы из активного пасса
-      for (uint32_t index = 0; index < kRenderTargetCount; ++index) {
-          if ((final_colors & (1u << index)) != 0 && !target.color_views[index]) {
-              target.color_views[index] = active_target->color_views[index];
-              target.color_formats[index] = active_target->color_formats[index];
-              target.color_surfaces[index] = active_target->color_surfaces[index];
-          }
+    bool matching_requested_views = true;
+    for (uint32_t index = 0; index < kRenderTargetCount; ++index) {
+      if ((requested_colors & (1u << index)) != 0 &&
+          (target.color_views[index] != active_target->color_views[index] ||
+           target.color_formats[index] != active_target->color_formats[index])) {
+        matching_requested_views = false;
+        break;
       }
+    }
+    if (matching_requested_views) {
+      final_colors = active_target->color_attachment_mask;
+      for (uint32_t index = 0; index < kRenderTargetCount; ++index) {
+        if ((final_colors & (1u << index)) != 0 && !target.color_views[index]) {
+          target.color_views[index] = active_target->color_views[index];
+          target.color_formats[index] = active_target->color_formats[index];
+          target.color_surfaces[index] = active_target->color_surfaces[index];
+        }
+      }
+    }
   }
 
   for (uint32_t index = 0; index < kRenderTargetCount; ++index) {
@@ -24876,14 +24884,14 @@ bool Gta4NativeGraphicsSystem::ResolveRenderingTarget(const NativeCommand& comma
 bool Gta4NativeGraphicsSystem::ResolveRenderingTargetMemo(
     const NativeCommand& command, VkImageView presenter_view, uint32_t presenter_width,
     uint32_t presenter_height, NativeRenderingTarget& target,
-    const NativeRenderingTarget& active_target) {
+    const NativeRenderingTarget* active_target) {
   const bool draw_command = command.type == CommandType::kDrawPrimitive ||
                             command.type == CommandType::kDrawPrimitiveUp ||
                             command.type == CommandType::kDrawIndexedPrimitive;
   if (!draw_command || !REXCVAR_GET(gta4_native_target_memo)) {
     native_target_memo_.valid = false;
     return ResolveRenderingTarget(command, presenter_view, presenter_width, presenter_height,
-                                  target, true, &active_target);
+                                  target, true, active_target);
   }
   const NativePipelineState& state = *command.pipeline_state;
   const NativeAttachmentUsage usage = GetRenderingTargetUsage(command);
@@ -24924,15 +24932,27 @@ bool Gta4NativeGraphicsSystem::ResolveRenderingTargetMemo(
   // Tail of ResolveRenderingTarget for an active target.
   const uint32_t requested_colors = usage.color_attachment_mask;
   uint32_t final_colors = requested_colors;
-  if ((active_target.color_attachment_mask & requested_colors) == requested_colors &&
-      active_target.depth_view == target.depth_view && active_target.samples == target.samples &&
-      active_target.width == target.width && active_target.height == target.height) {
-    final_colors = active_target.color_attachment_mask;
+  if (active_target &&
+      (active_target->color_attachment_mask & requested_colors) == requested_colors &&
+      active_target->depth_view == target.depth_view && active_target->samples == target.samples &&
+      active_target->width == target.width && active_target->height == target.height) {
+    bool matching_requested_views = true;
     for (uint32_t index = 0; index < kRenderTargetCount; ++index) {
-      if ((final_colors & (1u << index)) != 0 && !target.color_views[index]) {
-        target.color_views[index] = active_target.color_views[index];
-        target.color_formats[index] = active_target.color_formats[index];
-        target.color_surfaces[index] = active_target.color_surfaces[index];
+      if ((requested_colors & (1u << index)) != 0 &&
+          (target.color_views[index] != active_target->color_views[index] ||
+           target.color_formats[index] != active_target->color_formats[index])) {
+        matching_requested_views = false;
+        break;
+      }
+    }
+    if (matching_requested_views) {
+      final_colors = active_target->color_attachment_mask;
+      for (uint32_t index = 0; index < kRenderTargetCount; ++index) {
+        if ((final_colors & (1u << index)) != 0 && !target.color_views[index]) {
+          target.color_views[index] = active_target->color_views[index];
+          target.color_formats[index] = active_target->color_formats[index];
+          target.color_surfaces[index] = active_target->color_surfaces[index];
+        }
       }
     }
   }
@@ -31612,6 +31632,9 @@ bool Gta4NativeGraphicsSystem::RecordDepthSurfaceHandoff(VkCommandBuffer command
   if (!source_texture->resource.view || !destination->resource.view) {
     return reject("depth-stencil-view", source, destination);
   }
+  if (destination->pending_clear.valid) {
+    FlushPendingSurfaceClear(command_buffer, *destination, submitted_frame);
+  }
 
   auto* vulkan_provider = static_cast<ui::vulkan::VulkanProvider*>(provider_.get());
   const ui::vulkan::VulkanDevice* vulkan_device = vulkan_provider->vulkan_device();
@@ -32439,6 +32462,9 @@ bool Gta4NativeGraphicsSystem::RecordResolveClears(VkCommandBuffer command_buffe
                         resolve.trace_origin, resolve.trace_caller, resolve.trace_owner));
       }
       return true;
+    }
+    if (surface->pending_clear.valid) {
+      FlushPendingSurfaceClear(command_buffer, *surface, submitted_frame);
     }
 
     auto* vulkan_provider = static_cast<ui::vulkan::VulkanProvider*>(provider_.get());
@@ -37985,8 +38011,9 @@ const bool keeps_draw_state =
       continue;
     }
     NativeRenderingTarget target;
-    // Передаем указатель на текущий открытый таргет, чтобы склеить RenderPass
-    if (!ResolveRenderingTargetMemo(command, presenter_view, width, height, target, active_target)) {
+    // Pass active_target only when a rendering scope is actually open.
+    if (!ResolveRenderingTargetMemo(command, presenter_view, width, height, target,
+                                    rendering ? &active_target : nullptr)) {
       TraceModernShaderFailure(command,"draw.targets","Render target resolution rejected");
       if (collect_frame_diagnostics) {
         ++target_failures;
@@ -41892,9 +41919,11 @@ const bool keeps_draw_state =
   if (rendering) {
     end_rendering(__LINE__);
   }
-  for (const auto& image : native_surface_images_) {
-    if (image && image->pending_clear.valid) {
-      FlushPendingSurfaceClear(command_buffer, *image, submitted_frame);
+  if (diagnostic_frame) {
+    for (const auto& image : native_surface_images_) {
+      if (image && image->pending_clear.valid) {
+        FlushPendingSurfaceClear(command_buffer, *image, submitted_frame);
+      }
     }
   }
   tv_frame_trace_.reset();
@@ -41988,6 +42017,9 @@ const bool keeps_draw_state =
     }
     present_surface_override_ = nullptr;
     if (present_surface) {
+      if (present_surface->pending_clear.valid) {
+        FlushPendingSurfaceClear(command_buffer, *present_surface, submitted_frame);
+      }
       surface_present.source = present_source;
       surface_present.resource.image = present_surface->resource.image;
       surface_present.resource.view = present_surface->resource.view;

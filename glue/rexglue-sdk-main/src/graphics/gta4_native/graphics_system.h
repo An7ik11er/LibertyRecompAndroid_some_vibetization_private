@@ -2612,7 +2612,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   bool ResolveRenderingTargetMemo(const NativeCommand& command, VkImageView presenter_view,
                                   uint32_t presenter_width, uint32_t presenter_height,
                                   NativeRenderingTarget& target,
-                                  const NativeRenderingTarget& active_target);
+                                  const NativeRenderingTarget* active_target = nullptr);
   NativeAttachmentUsage GetRenderingTargetUsage(const NativeCommand& command) const;
   bool TransitionRenderingTarget(VkCommandBuffer command_buffer, NativeRenderingTarget& target);
   bool AllocateUpload(VkDeviceSize size, VkDeviceSize alignment, NativeUploadAllocation& allocation,
