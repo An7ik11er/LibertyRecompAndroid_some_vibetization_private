@@ -33418,11 +33418,12 @@ bool Gta4NativeGraphicsSystem::RecordPresent(
   //VkPipeline present_pipeline = GetOrCreateHDRPresentPipeline();
   //if (present_pipeline && frame_descriptor_pool_ && presenter_view && shader_source_view) {
   //начало
-    // SGSR: проверяем, выбран ли режим SGSR, и выбираем соответствующий пайплайн
-  // 29.10: gta4_native_upscaler is kRequiresRestart; one lookup by name per run,
-  // not a string query and copy on every present (58 per second in the traces).
+    // SGSR: проверяем, выбран ли режим SGSR, и масштабирует ли SGSR кадр (SGSR1 — строго апскейлер)
   static const bool use_sgsr = rex::cvar::Query<std::string>("gta4_native_upscaler") == "sgsr";
-  VkPipeline present_pipeline = use_sgsr ? GetOrCreateSGSRPresentPipeline() : GetOrCreateHDRPresentPipeline();
+  const bool sgsr_scale_active =
+      use_sgsr && (presenter_width > shader_source_width || presenter_height > shader_source_height);
+  VkPipeline present_pipeline =
+      sgsr_scale_active ? GetOrCreateSGSRPresentPipeline() : GetOrCreateHDRPresentPipeline();
   
   if (present_pipeline && frame_descriptor_pool_ && presenter_view && shader_source_view) {
   //конец
@@ -33553,9 +33554,8 @@ bool Gta4NativeGraphicsSystem::RecordPresent(
       }
 #endif
 //начало
-      // SGSR: отмечаем запрос SGSR в нативном проходе. Пока используется
-      // старый HDR-шейдер; ветка SGSR будет добавлена на следующем этапе.
-      const std::string requested_upscaler =
+      // SGSR: отмечаем запрос SGSR в нативном проходе.
+      static const std::string requested_upscaler =
           rex::cvar::Query<std::string>("gta4_native_upscaler");
       if (!aa_bits && !ssaa_bits && requested_upscaler == "fsr1") {
         static std::atomic<bool> logged_fsr_without_aa{false};
@@ -33565,11 +33565,15 @@ bool Gta4NativeGraphicsSystem::RecordPresent(
               "edge quality may be unstable");
         }
       }
-      if (!aa_bits && !ssaa_bits && requested_upscaler == "sgsr") {
+      if (use_sgsr) {
         // SGSR: одноразовый лог, подтверждающий, что кадр пошёл через SGSR-пайплайн
         static std::atomic<bool> logged_sgsr_pending{false};
         if (!logged_sgsr_pending.exchange(true)) {
-          REXLOG_INFO("gta4-native-upscaler: [SGSR] Successfully presenting frame using SGSR pipeline!");
+          REXLOG_INFO(
+              "gta4-native-upscaler: [SGSR] Active! source={}x{} destination={}x{} sharpness={:.2f} "
+              "pipeline={}",
+              shader_source_width, shader_source_height, presenter_width, presenter_height,
+              constants.sgsr_sharpness, sgsr_scale_active ? "sgsr" : "hdr");
         }
       }
 //конец
@@ -37064,7 +37068,9 @@ const bool keeps_draw_state =
             : (frontbuffer->width != frontbuffer->logical_width ||
                surface->logical_width != frontbuffer->logical_width) ? 10
             : (!surface->ever_written || surface->layout == VK_IMAGE_LAYOUT_UNDEFINED) ? 11 : 0;
+        static const bool sgsr_configured = rex::cvar::Query<std::string>("gta4_native_upscaler") == "sgsr";
         const bool eligible =
+            !sgsr_configured &&
             frontbuffer && surface && (!owner || owner->image == surface) && !cpu_read &&
             (other_use == texture_input_frames_.end() || other_use->second + 120 < submitted_frame) &&
             (flags & 7u) != 4u && !(flags & 0x300u) && !resolve.parameters_valid &&
@@ -42145,6 +42151,12 @@ bool Gta4NativeGraphicsSystem::ClearGuestOutput(
     const PresentCommand& present,
     const std::shared_ptr<const NativeTextureResource>& present_source,
     const std::shared_ptr<const EnvironmentalDataV2>& environmental_data) {
+  static const bool sgsr_configured = rex::cvar::Query<std::string>("gta4_native_upscaler") == "sgsr";
+  const bool sgsr_upscale_active = sgsr_configured && !IsNativeSsaaEnabled() &&
+      (display_width > width || display_height > height);
+  const uint32_t guest_output_width = sgsr_upscale_active ? display_width : width;
+  const uint32_t guest_output_height = sgsr_upscale_active ? display_height : height;
+
   // 60: a streamed frame was prepared and recorded while it was assembled: only its tail,
   // the presentation and the submission are left.
   if (stream_.open) {
@@ -42165,8 +42177,8 @@ bool Gta4NativeGraphicsSystem::ClearGuestOutput(
       stream_next_frame_ = submitted_frame + 1;
       CountStreamPresentHandle(present_source);  // 62: before the prediction moves on
       RememberStreamPresentSource(present_source);  // 61
-      stream_last_width_ = width;
-      stream_last_height_ = height;
+      stream_last_width_ = guest_output_width;
+      stream_last_height_ = guest_output_height;
     }
   }
 
@@ -42228,8 +42240,8 @@ bool Gta4NativeGraphicsSystem::ClearGuestOutput(
   }
 
   const bool refresh_result = presenter_->RefreshGuestOutput(
-      width, height, display_width, display_height,
-      [this, vulkan_device, width, height, submitted_frame, present_source, environmental_data,
+      guest_output_width, guest_output_height, display_width, display_height,
+      [this, vulkan_device, guest_output_width, guest_output_height, width, height, submitted_frame, present_source, environmental_data,
        trace_stages, trace_sequence,
        present](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         auto& vulkan_context =
@@ -42641,7 +42653,7 @@ bool Gta4NativeGraphicsSystem::ClearGuestOutput(
         {
           TRACE_SCOPE("Rec: RecordNativeFrame");
           frame_recorded = RecordNativeFrame(
-              command_buffer_, width, height, vulkan_context.image(), vulkan_context.image_view(),
+              command_buffer_, guest_output_width, guest_output_height, vulkan_context.image(), vulkan_context.image_view(),
               submitted_frame, present_source, environmental_data, vulkan_context.hdr_output(),
               vulkan_context.hdr_headroom(), presenter_transfer_written, presenter_written,
               trace_stages, trace_sequence, present.diagnostic_force_content_probe != 0);
@@ -43056,6 +43068,10 @@ void Gta4NativeGraphicsSystem::DestroyNativeRendererObjects() {
   if (hdr_present_pipeline_) {
     profile::CpuCall(profile::CpuOp::kDriverDestruction, [&] { return dfn.vkDestroyPipeline(device, hdr_present_pipeline_, nullptr); });
     hdr_present_pipeline_ = VK_NULL_HANDLE;
+  }
+  if (sgsr_present_pipeline_) {
+    profile::CpuCall(profile::CpuOp::kDriverDestruction, [&] { return dfn.vkDestroyPipeline(device, sgsr_present_pipeline_, nullptr); });
+    sgsr_present_pipeline_ = VK_NULL_HANDLE;
   }
   // Page descriptor sets reference the texture views and samplers below. GPU
   // completion is proven by DestroyVulkanWorkerObjects before this function;

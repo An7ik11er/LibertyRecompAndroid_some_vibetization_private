@@ -3019,16 +3019,19 @@ NativeResolutionOverride GetNativeResolutionOverride(uint32_t requested_width,
     static std::atomic<uint32_t> metalfx_extent_logs{0};
     if(metalfx_extent_logs.fetch_add(1)<8)REXLOG_INFO("gta4-metalfx-upscaler: quality={} selection={} input={}x{} output={}x{}",REXCVAR_GET(gta4_fsr1_quality),uint32_t(upscaling.selection),result.width,result.height,result.display_width,result.display_height);
   }
-  if (fsr1_requested) {
+  if (spatial_upscaler_requested) {
     static std::atomic<uint32_t> logged_upscaling{0};
     if (logged_upscaling.fetch_add(1, std::memory_order_relaxed) < 8) {
-      REXLOG_INFO("gta4-native-upscaler: quality={} selection={} render={}x{} display={}x{} hdr={} perceptual-before-hdr={}",
-          REXCVAR_GET(gta4_fsr1_quality), uint32_t(upscaling.selection), result.width, result.height,
+      REXLOG_INFO(
+          "gta4-native-upscaler: upscaler={} quality={} selection={} render={}x{} display={}x{} "
+          "hdr={} perceptual-before-hdr={}",
+          REXCVAR_GET(gta4_native_upscaler), REXCVAR_GET(gta4_fsr1_quality),
+          uint32_t(upscaling.selection), result.width, result.height,
           result.display_width, result.display_height, hdr_requested, perceptual_before_hdr);
       if (upscaling.selection == Fsr1Selection::kHdrInputUnsupported)
         REXLOG_WARN("gta4-native-upscaler: active backend converts to HDR before upscaling; using native resolution");
       else if (upscaling.selection == Fsr1Selection::kBelowRenderFloor)
-        REXLOG_WARN("gta4-native-upscaler: FSR1 input would fall below the validated 640x360 scene floor; using native resolution");
+        REXLOG_WARN("gta4-native-upscaler: spatial upscaler input would fall below the validated 640x360 scene floor; using native resolution");
     }
   }
   {

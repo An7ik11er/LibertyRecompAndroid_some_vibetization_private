@@ -1160,6 +1160,16 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
     // Get the up-to-date guest output paint configuration settings set by the
     // UI thread.
     std::unique_lock<std::mutex> config_lock(guest_output_paint_config_mutex_);
+#if defined(REX_HAS_FIDELITYFX_FSR1)
+    const float current_reduction = float(REXCVAR_GET(present_fsr_sharpness_reduction));
+    if (guest_output_paint_config_.GetFsrSharpnessReduction() != current_reduction) {
+      guest_output_paint_config_.SetFsrSharpnessReduction(current_reduction);
+    }
+    const float current_cas_sharpness = float(REXCVAR_GET(present_cas_additional_sharpness));
+    if (guest_output_paint_config_.GetCasAdditionalSharpness() != current_cas_sharpness) {
+      guest_output_paint_config_.SetCasAdditionalSharpness(current_cas_sharpness);
+    }
+#endif
     *paint_config_out = guest_output_paint_config_;
   }
 

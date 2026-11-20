@@ -511,6 +511,12 @@ bool Gta4NativeGraphicsSystem::ClearGuestOutputStreamed(
     const PresentCommand& present,
     const std::shared_ptr<const NativeTextureResource>& present_source,
     const std::shared_ptr<const EnvironmentalDataV2>& environmental_data) {
+  static const bool sgsr_configured = rex::cvar::Query<std::string>("gta4_native_upscaler") == "sgsr";
+  const bool sgsr_upscale_active = sgsr_configured && !IsNativeSsaaEnabled() &&
+      (display_width > width || display_height > height);
+  const uint32_t guest_output_width = sgsr_upscale_active ? display_width : width;
+  const uint32_t guest_output_height = sgsr_upscale_active ? display_height : height;
+
   const profile::CpuScope profile_scope(profile::CpuOp::kRefreshOutput);
   if (!presenter_ || !provider_) {
     StreamFlush("no-presenter");
@@ -531,17 +537,17 @@ bool Gta4NativeGraphicsSystem::ClearGuestOutputStreamed(
     }
     CountStreamPresentHandle(present_source);  // 62
     RememberStreamPresentSource(present_source);
-    stream_last_width_ = width;
-    stream_last_height_ = height;
+    stream_last_width_ = guest_output_width;
+    stream_last_height_ = guest_output_height;
   }
-  stream_.width = width;
-  stream_.height = height;
+  stream_.width = guest_output_width;
+  stream_.height = guest_output_height;
   stream_.present_source = present_source;
   stream_.environmental_data = environmental_data;
   stream_.force_content_probe = present.diagnostic_force_content_probe != 0;
   bool callback_ran = false;
   const bool refresh_result = presenter_->RefreshGuestOutput(
-      width, height, display_width, display_height,
+      guest_output_width, guest_output_height, display_width, display_height,
       [this, present_source, &callback_ran](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         callback_ran = true;
         auto& vulkan_context =
