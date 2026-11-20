@@ -206,6 +206,15 @@ enum class TextId : uint8_t {
   kUltraPerformance,
   kFsr3FrameGeneration,
   kDlssFrameGeneration,
+  kSgsr,
+  kUpscalerSharpnessLabel,
+  kSharp0,
+  kSharp05,
+  kSharp1,
+  kSharp15,
+  kSharp2,
+  kSharp3,
+  kSharp4,
   kCount,
 };
 
@@ -213,6 +222,58 @@ struct Choice {
   std::string_view value;
   TextId text;
 };
+
+namespace upscaler_sharpness {
+inline constexpr double kMinimumSharpness = 0.0;
+inline constexpr double kMaximumSharpness = 2.0;
+inline constexpr int32_t kSliderIntervals = 20;
+inline constexpr uint8_t kSliderPositions = 21;
+
+inline double CurrentVirtualSharpness() noexcept {
+  const std::string upscaler = rex::cvar::GetFlagByName("gta4_native_upscaler");
+  if (upscaler == "sgsr") {
+    // Physical SGSR [1.0, 2.0] maps linearly to virtual [0.0, 2.0]:
+    // virtual = (physical - 1.0) * 2.0
+    const double physical = rex::cvar::Query<double>("gta4_sgsr_sharpness");
+    const double clamped = std::clamp(physical, 1.0, 2.0);
+    return (clamped - 1.0) * 2.0;
+  }
+  if (upscaler == "fsr1") {
+    // FSR RCAS reduction in stops [2.0, 0.0] maps to virtual [0.0, 2.0]:
+    // virtual = 2.0 - reduction
+    const double reduction = rex::cvar::Query<double>("gta4_fsr1_sharpness_reduction");
+    const double clamped = std::clamp(reduction, 0.0, 2.0);
+    return 2.0 - clamped;
+  }
+  return 0.0;
+}
+
+inline int32_t CurrentSliderPosition() noexcept {
+  const double v = CurrentVirtualSharpness();
+  return static_cast<int32_t>(std::clamp<int32_t>(static_cast<int32_t>(std::lround(v * 10.0)), 0, kSliderIntervals));
+}
+
+inline void AdjustSlider(int32_t delta) noexcept {
+  if (delta == 0) return;
+  const int32_t current_pos = CurrentSliderPosition();
+  const int32_t target_pos = std::clamp(current_pos + delta, 0, kSliderIntervals);
+  const double virtual_sharpness = static_cast<double>(target_pos) * 0.1;
+
+  const std::string upscaler = rex::cvar::GetFlagByName("gta4_native_upscaler");
+  if (upscaler == "sgsr") {
+    // Virtual [0.0, 2.0] maps to physical SGSR [1.0, 2.0]:
+    // physical = 1.0 + virtual * 0.5 = 1.0 + target_pos * 0.05
+    const double target_physical = 1.0 + static_cast<double>(target_pos) * 0.05;
+    rex::cvar::SetFlagByName("gta4_sgsr_sharpness", fmt::format("{:.2f}", target_physical));
+  } else if (upscaler == "fsr1") {
+    // Virtual [0.0, 2.0] maps to RCAS reduction [2.0, 0.0]:
+    // reduction = 2.0 - virtual = 2.0 - target_pos * 0.1
+    const double target_reduction = 2.0 - virtual_sharpness;
+    rex::cvar::SetFlagByName("gta4_fsr1_sharpness_reduction", fmt::format("{:.1f}", target_reduction));
+    rex::cvar::SetFlagByName("present_fsr_sharpness_reduction", fmt::format("{:.1f}", target_reduction));
+  }
+}
+}  // namespace upscaler_sharpness
 
 enum class SettingBinding : uint8_t {
   kCvar,
@@ -224,6 +285,7 @@ enum class SettingBinding : uint8_t {
   kDrawDistanceSlider,
   kTouchLayoutEditor,
   kSonyFeatures,
+  kUpscalerSharpnessSlider,
 };
 
 struct Setting {
@@ -354,10 +416,7 @@ constexpr std::array kAntiAliasingChoices = {
 constexpr std::array kUpscalerChoices = {
     Choice{"native", TextId::kNative},
     Choice{"fsr1", TextId::kFsr1},
-    // SGSR: временно используем TextId::kFsr1, чтобы не менять enum TextId;
-    // после добавления kSgsr заменить на него. В меню пункт будет
-    // отображаться как FSR 1, но cvar уже принимает "sgsr".
-    Choice{"sgsr", TextId::kFsr3},
+    Choice{"sgsr", TextId::kSgsr},
 #if defined(LIBERTY_HAS_FSR3)
     Choice{"fsr3", TextId::kFsr3},
 #endif
@@ -367,6 +426,15 @@ constexpr std::array kUpscalerChoices = {
 #if REX_PLATFORM_MAC && !REX_PLATFORM_IOS
     Choice{"metalfx", TextId::kMetalFxUpscaler},
 #endif
+};
+constexpr std::array kSgsrSharpnessChoices = {
+    Choice{"0", TextId::kSharp0},
+    Choice{"0.5", TextId::kSharp05},
+    Choice{"1", TextId::kSharp1},
+    Choice{"1.5", TextId::kSharp15},
+    Choice{"2", TextId::kSharp2},
+    Choice{"3", TextId::kSharp3},
+    Choice{"4", TextId::kSharp4},
 };
 constexpr std::array kFrameGenerationChoices = {
     Choice{"off", TextId::kOff},
@@ -447,6 +515,8 @@ constexpr std::array kSettings = {
             kUpscalerChoices.size(), true, SettingBinding::kUpscaler},
     Setting{"LR_FSR", TextId::kFsrLabel, "gta4_fsr1_quality", kFsrQualityChoices.data(),
             kFsrQualityChoices.size(), true, SettingBinding::kUpscalingQuality},
+    Setting{"LR_SGSR_SHARP", TextId::kUpscalerSharpnessLabel, "", nullptr,
+            upscaler_sharpness::kSliderPositions, false, SettingBinding::kUpscalerSharpnessSlider},
     Setting{"LR_AA", TextId::kPostAaLabel, "gta4_native_anti_aliasing", kAntiAliasingChoices.data(),
             kAntiAliasingChoices.size(), false, SettingBinding::kAntiAliasing},
     Setting{"LR_FRAMEGEN", TextId::kFrameGenerationLabel, "gta4_native_frame_generation",
@@ -615,6 +685,15 @@ constexpr std::array<std::string_view, static_cast<size_t>(TextId::kCount)> kStr
     "Ultra Performance",
     "FSR 2x",
     "DLSS 2x",
+    "SGSR",
+    "Sharpness",
+    "0 (Off)",
+    "0.5",
+    "1.0",
+    "1.5",
+    "2.0",
+    "3.0",
+    "4.0",
 };
 
 struct NativePageState {
@@ -1141,6 +1220,10 @@ bool SettingAvailable(const Setting& setting, uint32_t capabilities) {
     auto* graphics = runtime ? runtime->graphics_system() : nullptr;
     return graphics && graphics->GetTitleCommandAbi(kTitleId) == kTitleCommandAbi;
   }
+  if (setting.binding == SettingBinding::kUpscalerSharpnessSlider) {
+    const auto upscaler = rex::cvar::GetFlagByName("gta4_native_upscaler");
+    return upscaler == "sgsr" || upscaler == "fsr1";
+  }
   return true;
 }
 
@@ -1204,6 +1287,9 @@ uint32_t ReadFrontendSliderPosition(uint8_t* base, int32_t row_index,
   const Setting* setting = FindSettingByRow(base, row_index);
   if (setting && setting->binding == SettingBinding::kDrawDistanceSlider) {
     return static_cast<uint32_t>(gta4::draw_distance::SliderPosition(CurrentDrawDistanceScale()));
+  }
+  if (setting && setting->binding == SettingBinding::kUpscalerSharpnessSlider) {
+    return static_cast<uint32_t>(upscaler_sharpness::CurrentSliderPosition());
   }
   return REX_LOAD_U32(retail_preference_address);
 }
@@ -1273,7 +1359,8 @@ bool WriteSettingRow(uint8_t* base, uint32_t destination, const Setting& source)
   REX_STORE_U16(destination + kOptionValueOffset, kSafeStockPreference);
   REX_STORE_U8(destination + kOptionScalerOffset, setting.choice_count);
   REX_STORE_U8(destination + kOptionDisplayValueOffset,
-               setting.binding == SettingBinding::kDrawDistanceSlider
+               (setting.binding == SettingBinding::kDrawDistanceSlider ||
+                setting.binding == SettingBinding::kUpscalerSharpnessSlider)
                    ? gta4::draw_distance::kSliderDisplayType
                    : kSafeStockDisplayValue);
   return true;
@@ -1609,6 +1696,17 @@ void ChangeSetting(const Setting& source, int32_t delta) {
         CurrentDrawDistanceScale(), delta);
     return;
   }
+  if (setting.binding == SettingBinding::kUpscalerSharpnessSlider) {
+    const double previous = upscaler_sharpness::CurrentVirtualSharpness();
+    upscaler_sharpness::AdjustSlider(delta);
+    const double requested = upscaler_sharpness::CurrentVirtualSharpness();
+    g_display_menu.rebuild_pending = true;
+    REXLOG_INFO(
+        "GTA4MenuTrace seq={} point=setting-change key='{}' old={:.1f} new={:.1f} "
+        "direction={} apply=live",
+        ++g_menu_trace_sequence, setting.key, previous, requested, delta);
+    return;
+  }
   const std::string old_value = CurrentSettingValue(setting);
   uint8_t index = CurrentChoiceIndex(setting);
   if (delta > 0) {
@@ -1893,7 +1991,8 @@ extern "C" void sub_82252A98(PPCContext& ctx, uint8_t* base) {
       return;
     }
     if (const Setting* setting = FindSettingByRow(base, ctx.r6.s32)) {
-      if (setting->binding == SettingBinding::kDrawDistanceSlider) {
+      if (setting->binding == SettingBinding::kDrawDistanceSlider ||
+          setting->binding == SettingBinding::kUpscalerSharpnessSlider) {
         // The retail slider draws its bar separately. The multiplier is
         // materialized beside the left-hand label instead of over the bar.
         ctx.r3.u64 = 0;
@@ -2068,6 +2167,13 @@ extern "C" void sub_8229CD40(PPCContext& ctx, uint8_t* base) {
       const Setting* setting = FindSettingByRow(base, index);
       if (setting && setting->binding == SettingBinding::kDrawDistanceSlider) {
         slider_label = fmt::format("{} ({:.1f}x)", TextString(text), CurrentDrawDistanceScale());
+      } else if (setting && setting->binding == SettingBinding::kUpscalerSharpnessSlider) {
+        const double virtual_sharpness = upscaler_sharpness::CurrentVirtualSharpness();
+        if (virtual_sharpness <= 0.0) {
+          slider_label = fmt::format("{} (Off)", TextString(text));
+        } else {
+          slider_label = fmt::format("{} ({:.1f})", TextString(text), virtual_sharpness);
+        }
       }
       const std::string_view label = slider_label.empty() ? TextString(text) : slider_label;
       const std::string raw_label =

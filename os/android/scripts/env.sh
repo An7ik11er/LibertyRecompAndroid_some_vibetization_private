@@ -20,6 +20,8 @@ elif [ -z "${ANDROID_HOME:-}" ] || [[ "${ANDROID_HOME:-}" =~ ^[Dd]: ]] || [[ "${
 fi
 export ANDROID_HOME
 export ANDROID_SDK_ROOT="$ANDROID_HOME"
+export GRADLE_USER_HOME="G:/cod/cacheSlopodroid/.gradle"
+export ANDROID_USER_HOME="G:/cod/cacheSlopodroid/.android"
 export NDK_VER="${NDK_VER:-30.0.16248370}"
 export ANDROID_NDK="${ANDROID_NDK:-$ANDROID_HOME/ndk/$NDK_VER}"
 export JAVA_HOME="${JAVA_HOME:-/c/Program Files/Android/Android Studio/jbr}"

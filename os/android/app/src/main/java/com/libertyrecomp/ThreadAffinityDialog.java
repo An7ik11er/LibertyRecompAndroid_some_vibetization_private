@@ -324,10 +324,10 @@ final class ThreadAffinityDialog {
             new Th("xma_decoder", "XMA Decoder", "Decodes compressed sounds",
                     K_AUDIO_LANE, -16, K_WORKERS, -16),
             new Th("audio_worker", "Audio Worker", "Dispatches XAudio frame callbacks",
-                    K_AUDIO_LANE, -16, K_WORKERS, -16)),
-        new Group("world", "World streaming & file IO",
-            new Th("rage_stream", "RageStream", "Loads the city around you",
-                    K_LITTLE, 2, K_WORKERS, 0),
+                    K_AUDIO_LANE, -16, K_WORKERS, -16),
+            new Th("rage_audio_ctrl", "RageAudioCtrl", "RAGE 3D audio controller (positioning & attenuation)",
+                    K_LITTLE, 2, K_WORKERS, 0)),
+        new Group("world", "File IO & kernel tasks",
             new Th("rage_fileio", "RageFileIO", "Game file reads",
                     K_LITTLE, KEEP, K_LITTLE, KEEP),
             new Th("kernel_io", "Kernel IO / host tasks", "Emulated Xbox kernel workers",
@@ -397,6 +397,9 @@ final class ThreadAffinityDialog {
             for (Iterator<String> it = o.keys(); it.hasNext(); ) {
                 String k = it.next();
                 out.put(k, o.getInt(k));
+            }
+            if (out.containsKey("t.rage_stream") && !out.containsKey("t.rage_audio_ctrl")) {
+                out.put("t.rage_audio_ctrl", out.remove("t.rage_stream"));
             }
        } catch (Exception e) {
     android.util.Log.e("LibertyRecomp", "affinity_manual JSON broken: "
@@ -870,9 +873,9 @@ final class ThreadAffinityDialog {
             flag(flagged, rowOf.get("sdl_thread"));
             notes.add("SDLThread on little cores only: finished frames can reach the screen late.");
         }
-        // R6: background / world workers pushed onto the prime core only, next to RenderGuest
+        // R6: background / audio controller workers pushed onto the prime core only, next to RenderGuest
         if ((rg & topo.prime) != 0) {
-            for (String id : new String[] {"rage_stream", "rage_jobs", "rage_physics", "rage_other",
+            for (String id : new String[] {"rage_audio_ctrl", "rage_jobs", "rage_physics", "rage_other",
                                            "cmd_retirer", "xma_decoder"}) {
                 int m = eff.get(id);
                 if (m != 0 && (m & ~topo.prime) == 0) {
@@ -882,7 +885,7 @@ final class ThreadAffinityDialog {
             }
         }
         // R7: everything heavy on one cluster while another cluster is left empty
-        int heavyAll = union | ag | eff.get("rage_jobs") | eff.get("rage_stream");
+        int heavyAll = union | ag | eff.get("rage_jobs") | eff.get("rage_audio_ctrl");
         if (heavyAll != 0 && (heavyAll & ~topo.big) == 0 && Integer.bitCount(topo.big) <= 3) {
             notes.add("All heavy threads on the big cores only: the prime and little cores stay idle.");
         }

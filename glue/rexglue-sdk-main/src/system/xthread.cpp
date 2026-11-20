@@ -701,7 +701,8 @@ void XThread::Execute() {
   } else if (address == 0x821B6F18 || rage_fn == 0x821B6F18) {
     pthread_setname_np(pthread_self(), "RenderGuest");
   } else if (rage_fn == 0x82902728) {
-    pthread_setname_np(pthread_self(), "RageStream");
+    // 0x82902728 is rage::audController (3D audio positioning/panning), not world streaming.
+    pthread_setname_np(pthread_self(), "RageAudioCtrl");
   } else if (rage_fn == 0x8285D368) {
     pthread_setname_np(pthread_self(), "RageJobWork");
   } else if (rage_fn == 0x82798BA0 || rage_fn == 0x827989F8) {

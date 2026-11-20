@@ -1,3 +1,5 @@
+#pragma once
+
 // Derived by tools/derive_draw_distance_hooks.py --write.
 // Complete retail PPC logic; only the documented operand below is replaced.
 // Hand-optimized for ARM64 NEON, inlined sub_821D0478/sub_823B32E0, and
@@ -122,293 +124,475 @@ __attribute__((always_inline)) inline float CalcDist3dNEON(
 
 }  // namespace scan_fast
 
-extern "C" void sub_821D6260(PPCContext& ctx, uint8_t* base) {
-  if (!IsNativeMode()) {
-    __imp__sub_821D6260(ctx, base);
-    return;
-  }
-  const float native_remap_limit = gta4::draw_distance::ResolveRemapLimit(
-      scan_fast::FastLoadF32(base, kDistanceScaleInputGlobal));
-  REX_FUNC_PROLOGUE();
 
-  // Preserve guest stack pointer and LR for indirect virtual calls; local variables
-  // live in host registers/stack so PPC non-volatile r14..r31 / f16..f31 remain untouched.
-  const uint64_t saved_lr = ctx.lr;
-  const uint64_t saved_r1 = ctx.r1.u64;
-  const uint32_t frame_r1 = static_cast<uint32_t>(saved_r1) - 464u;
-  scan_fast::FastStoreU32(base, frame_r1, static_cast<uint32_t>(saved_r1));
-  ctx.r1.u32 = frame_r1;
-  auto restore_and_return = [&]() {
-    ctx.r1.u64 = saved_r1;
-    ctx.lr = saved_lr;
-  };
+extern "C" {
+void sub_821D0478(PPCContext& ctx, uint8_t* base);
+void sub_821E5278(PPCContext& ctx, uint8_t* base);
+}
 
-  uint32_t r27 = ctx.r3.u32;
-  const uint32_t r15 = ctx.r4.u32;
-  const uint32_t r25 = ctx.r5.u32;
+namespace scan_entities_v3_detail {
 
-  // Inlined sub_821D0478 (reads byte at 0x82D515A1).
-  const uint8_t dflag = scan_fast::FastLoadU8(base, 0x82D515A1u);
-  ctx.fpscr.disableFlushMode();
-  const float f23 = scan_fast::FastLoadF32(base, r25 + 2336u);
-  constexpr uint32_t kCounterAddr = 0x82B85390u;
-  scan_fast::FastStoreU32(base, kCounterAddr, scan_fast::FastLoadU32(base, kCounterAddr) + 1u);
-  const bool enable_lod_mark = (dflag == 0);
+[[gnu::always_inline]] inline float LoadF32BE(uint8_t* base, uint32_t ea) noexcept {
+    return std::bit_cast<float>(REX_LOAD_U32(ea));
+}
 
-  if (r27 >= r15) {
-    restore_and_return();
-    return;
-  }
+[[gnu::always_inline]] inline void StoreF32BE(uint8_t* base, uint32_t ea, float val) noexcept {
+    REX_STORE_U32(ea, std::bit_cast<uint32_t>(val));
+}
 
-  static const scan_fast::RdataConsts kConsts = scan_fast::LoadRdataConsts(base);
-  const float f26 = kConsts.f26;
-  const float f24 = kConsts.f24;
-  const float f16 = kConsts.f16;
-  const float f27 = kConsts.f27;
-  const float f20 = kConsts.f20;
-  const float f21 = kConsts.f21;
-  const float f22 = kConsts.f22;
-  const float f17 = kConsts.f17;
-  const float f18 = kConsts.f18;
-  const float f28 = kConsts.f28;
-  const float f25 = native_remap_limit;
-  const float f19 = kConsts.f19;
+[[gnu::always_inline]] inline int32_t PpcFctiwz(float v) noexcept {
+    if (std::isnan(v)) [[unlikely]] {
+        return static_cast<int32_t>(0x80000000u);
+    }
+    if (v >= 2147483648.0f) [[unlikely]] {
+        return INT32_MAX;
+    }
+    if (v <= -2147483648.0f) [[unlikely]] {
+        return INT32_MIN;
+    }
+    return static_cast<int32_t>(v);
+}
 
-  // Hoist per-scan invariants.
-  const bool lod_fade_enabled = (scan_fast::FastLoadU32(base, 0x82D928E0u) != 0);
-  const float mult2340 = scan_fast::FastLoadF32(base, r25 + 2340u);
-  const float mult12708_plus_f28 = scan_fast::FastLoadF32(base, 0x82A90000u + 12708u) + f28;
-  const bool check_parent_flag =
-      (scan_fast::FastLoadU8(base, 0x83030000u + 10579u) != 0) &&
-      (static_cast<int32_t>(scan_fast::FastLoadU32(base, 0x82AB0000u - 30228u)) > 0);
-  const uint8_t skip_alpha = scan_fast::FastLoadU8(base, 0x82BA0000u - 31646u);
-
-  const uint32_t cam_ea = (r25 + 2304u) & ~0xFu;
 #if defined(__aarch64__) || defined(_M_ARM64)
-  const float32x4_t cam_xyz =
-      vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(GuestPointer(base, cam_ea))));
-  auto calc_dist3d = [&](uint32_t pos_addr) -> float {
-    return scan_fast::CalcDist3dNEON(base, pos_addr, cam_xyz);
-  };
+[[gnu::always_inline]] inline float32x4_t LoadGuestVec4BE(uint8_t* base, uint32_t ea) noexcept {
+    const uint8x16_t raw = vld1q_u8(REX_RAW_ADDR(ea & ~0xFu));
+    return vreinterpretq_f32_u8(vrev32q_u8(raw));
+}
+
+// Single-precision FMADD.S + FSQRT.S (zero FCVT S<->D overhead, exact PPC order)
+[[gnu::always_inline]] inline float Distance3D_ZYX(float32x4_t pos, float32x4_t cam) noexcept {
+    const float32x4_t d = vsubq_f32(pos, cam);
+    const float dx = vgetq_lane_f32(d, 0);
+    const float dy = vgetq_lane_f32(d, 1);
+    const float dz = vgetq_lane_f32(d, 2);
+    return std::sqrt(std::fmaf(dx, dx, std::fmaf(dy, dy, dz * dz)));
+}
+
+[[gnu::always_inline]] inline float Distance3D_YZX(float32x4_t pos, float32x4_t cam) noexcept {
+    const float32x4_t d = vsubq_f32(pos, cam);
+    const float dx = vgetq_lane_f32(d, 0);
+    const float dy = vgetq_lane_f32(d, 1);
+    const float dz = vgetq_lane_f32(d, 2);
+    return std::sqrt(std::fmaf(dx, dx, std::fmaf(dz, dz, dy * dy)));
+}
 #else
-  const float cam_x = scan_fast::FastLoadF32(base, cam_ea + 0);
-  const float cam_y = scan_fast::FastLoadF32(base, cam_ea + 4);
-  const float cam_z = scan_fast::FastLoadF32(base, cam_ea + 8);
-  auto calc_dist3d = [&](uint32_t pos_addr) -> float {
-    const uint32_t aligned = pos_addr & ~0xFu;
-    const float dx = scan_fast::FastLoadF32(base, aligned + 0) - cam_x;
-    const float dy = scan_fast::FastLoadF32(base, aligned + 4) - cam_y;
-    const float dz = scan_fast::FastLoadF32(base, aligned + 8) - cam_z;
-    return std::sqrt(std::fma(dx, dx, std::fma(dy, dy, dz * dz)));
-  };
+struct Vec4F32 { float x, y, z, w; };
+
+[[gnu::always_inline]] inline Vec4F32 LoadGuestVec4BE(uint8_t* base, uint32_t ea) noexcept {
+    const uint32_t a = ea & ~0xFu;
+    return { LoadF32BE(base, a), LoadF32BE(base, a + 4u),
+             LoadF32BE(base, a + 8u), LoadF32BE(base, a + 12u) };
+}
+
+[[gnu::always_inline]] inline float Distance3D_ZYX(Vec4F32 pos, Vec4F32 cam) noexcept {
+    const float dx = pos.x - cam.x;
+    const float dy = pos.y - cam.y;
+    const float dz = pos.z - cam.z;
+    return std::sqrt(std::fmaf(dx, dx, std::fmaf(dy, dy, dz * dz)));
+}
+
+[[gnu::always_inline]] inline float Distance3D_YZX(Vec4F32 pos, Vec4F32 cam) noexcept {
+    const float dx = pos.x - cam.x;
+    const float dy = pos.y - cam.y;
+    const float dz = pos.z - cam.z;
+    return std::sqrt(std::fmaf(dx, dx, std::fmaf(dz, dz, dy * dy)));
+}
 #endif
 
-  auto float_to_alpha_byte = [](float val) -> uint8_t {
-    const int32_t iv = std::isnan(val)
-                           ? int32_t(0x80000000u)
-                           : (val > float(INT_MAX) ? INT_MAX : int32_t(val));
-    return uint8_t(iv);
-  };
-  auto clear_parent_fade = [&](uint32_t parent) {
-    if (parent != 0) {
-      const uint32_t f40 = scan_fast::FastLoadU32(base, parent + 40);
-      if ((f40 >> 12) & 0x1u) scan_fast::FastStoreU8(base, parent + 99, 255);
-      scan_fast::FastStoreU32(base, parent + 40, f40 & ~0x1000u);
-    }
-  };
-
-  constexpr uint32_t kModelInfoTable = 0x82B3A1A0u;
-  constexpr uint32_t kSpecialEntityMask = 12582912u;
-
-  for (; r27 < r15; r27 += 8) {
-    const uint32_t r31 = scan_fast::FastLoadU32(base, r27);
-    if (r31 == 0) continue;
-
-    const int16_t model_idx = static_cast<int16_t>(scan_fast::FastLoadU16(base, r31 + 46));
-    const uint32_t r30 = scan_fast::FastLoadU32(base, r31 + 76);
-    const uint32_t r29 =
-        scan_fast::FastLoadU32(base, kModelInfoTable + uint32_t(int32_t(model_idx) * 4));
-
-    if (scan_fast::IsParentEntityFadedOut(base, r30, lod_fade_enabled)) {
-      scan_fast::FastStoreU32(base, r27, 0);
-      const uint16_t flags92 = scan_fast::FastLoadU16(base, r31 + 92) & 65531u;
-      scan_fast::FastStoreU8(base, r31 + 99, 0);
-      scan_fast::FastStoreU16(base, r31 + 92, flags92);
-      continue;
-    }
-
-    if (check_parent_flag && r30 != 0 && (scan_fast::FastLoadU8(base, r30 + 36) & 0x1u) == 0) {
-      scan_fast::FastStoreU32(base, r27, 0);
-      continue;
-    }
-
-    const uint32_t flags36 = scan_fast::FastLoadU32(base, r31 + 36);
-    const uint32_t flags40_31 = scan_fast::FastLoadU32(base, r31 + 40);
-    if ((flags36 & 0x4000000u) == 0 || (flags40_31 & 0x100u) != 0) {
-      scan_fast::FastStoreU32(base, r27, 0);
-      continue;
-    }
-
-    ctx.r3.u64 = r29;
-    ctx.ctr.u64 = scan_fast::FastLoadU32(base, scan_fast::FastLoadU32(base, r29) + 12);
-    ctx.lr = 0x821D63E8;
-    REX_CALL_INDIRECT_FUNC(ctx.ctr.u32);
-
-    const uint32_t type_id = ctx.r3.u32 & 0xFFu;
-    if (type_id == 5) {
-      if ((flags36 & 0x80000u) == 0) continue;
-      const uint32_t p32 = scan_fast::FastLoadU32(base, r31 + 32);
-      scan_fast::FastStoreF32(base, r27 + 4, calc_dist3d((p32 != 0) ? (p32 + 48) : (r31 + 16)));
-      continue;
-    }
-    if (type_id == 6) {
-      if ((flags36 >> 6) & 0x1u) {
-        const uint32_t p120 = scan_fast::FastLoadU32(base, r31 + 120);
-        if (p120 == 0 || (scan_fast::FastLoadU8(base, p120) & 0x40u) == 0) {
-          scan_fast::FastStoreU32(base, r27, 0);
-          continue;
-        }
-      }
-      if ((flags36 & 0x80000u) == 0) continue;
-      const uint32_t p32 = scan_fast::FastLoadU32(base, r31 + 32);
-      float cur_dist = calc_dist3d((p32 != 0) ? (p32 + 48) : (r31 + 16));
-      scan_fast::FastStoreF32(base, r27 + 4, cur_dist);
-
-      if ((flags40_31 & 0x3C00000u) == kSpecialEntityMask &&
-          (scan_fast::FastLoadU32(base, r31 + 572) & 0x20000000u) != 0) {
-        const uint32_t sub_obj = scan_fast::FastLoadU32(base, r31 + 2688);
-        if (sub_obj != 0) {
-          ctx.r3.u64 = sub_obj;
-          ctx.ctr.u64 = scan_fast::FastLoadU32(base, scan_fast::FastLoadU32(base, sub_obj) + 84);
-          ctx.lr = 0x821D688C;
-          REX_CALL_INDIRECT_FUNC(ctx.ctr.u32);
-          cur_dist = static_cast<float>(ctx.f1.f64 + static_cast<double>(cur_dist));
-          scan_fast::FastStoreF32(base, r27 + 4, cur_dist);
-        }
-      }
-
-      ctx.r3.u64 = r31;
-      ctx.ctr.u64 = scan_fast::FastLoadU32(base, scan_fast::FastLoadU32(base, r31) + 36);
-      ctx.lr = 0x821D68AC;
-      REX_CALL_INDIRECT_FUNC(ctx.ctr.u32);
-      if ((ctx.r3.u32 & 0xFFu) == 0) continue;
-
-      ctx.r3.u64 = r31;
-      ctx.lr = 0x821D68C0;
-      sub_821E5278(ctx, base);
-      if (ctx.r3.u32 == 0) continue;
-
-      ctx.ctr.u64 = scan_fast::FastLoadU32(base, scan_fast::FastLoadU32(base, ctx.r3.u32) + 84);
-      ctx.lr = 0x821D68D8;
-      REX_CALL_INDIRECT_FUNC(ctx.ctr.u32);
-      const float latest = scan_fast::FastLoadF32(base, r27 + 4);
-      scan_fast::FastStoreF32(base, r27 + 4, static_cast<float>(ctx.f1.f64 + static_cast<double>(latest)));
-      continue;
-    }
-
-    const uint32_t p32_31 = scan_fast::FastLoadU32(base, r31 + 32);
-    const uint32_t pos_ptr_31 = (p32_31 != 0) ? (p32_31 + 48) : (r31 + 16);
-    uint32_t pos_ptr = pos_ptr_31;
-    if (r30 != 0) {
-      const uint32_t p32_30 = scan_fast::FastLoadU32(base, r30 + 32);
-      pos_ptr = (p32_30 != 0) ? (p32_30 + 48) : (r30 + 16);
-    }
-
-    const float lod_dist_raw = scan_fast::FastLoadF32(base, r31 + 80);
-    float f29 = lod_dist_raw;
-    const uint32_t r10_bit = (flags36 >> 23) & 0x1u;
-    float f30 = calc_dist3d(pos_ptr);
-
-    if (r10_bit != 0 && f23 > f19) {
-      f29 = f23;
-    }
-
-    const float f31 = mult2340 * f29;
-
-    if ((flags36 & 0x2000000u) == 0) {
-      if (f30 > f25 && f31 > f25 && f30 < (f31 + f28)) {
-        f30 = (f31 - f25) + f30;
-      }
-    }
-
-    float sort_dist = (r10_bit != 0) ? f18 : f17;
-    sort_dist += (r30 != 0) ? calc_dist3d(pos_ptr_31) : f30;
-    scan_fast::FastStoreF32(base, r27 + 4, sort_dist);
-
-    ctx.r3.u64 = r31;
-    ctx.ctr.u64 = scan_fast::FastLoadU32(base, scan_fast::FastLoadU32(base, r31) + 84);
-    ctx.lr = 0x821D6548;
-    REX_CALL_INDIRECT_FUNC(ctx.ctr.u32);
-
-    float f0 = static_cast<float>(ctx.f1.f64 + static_cast<double>(f23));
-    float f13 = f28;
-    if (f31 < f0) f0 = f31;
-
-    if (r30 == 0) {
-      const float f12 = (f29 >= f0) ? f0 : f29;
-      if (f12 > f22) {
-        f13 = std::fma(f12, f21, f20);
-      }
-      if ((flags36 & 0x2000000u) != 0) {
-        f0 = scan_fast::FastLoadF32(base, 0x82A90000u + 12728u) * f0;
-      }
-    }
-
-    const uint32_t r10_flag = (scan_fast::FastLoadU32(base, r29 + 64) >> 3) & 0x1u;
-    if (r10_flag != 0) {
-      if (((f13 + f30) - f28) < f31) {
-        clear_parent_fade(r30);
-        continue;
-      }
-      if ((f30 - f28) < f31) {
-        f0 = ((f0 + f28) - f30) / f13;
-        if (f0 >= f27) f0 = f27;
-
-        const bool can_write_31_alpha = (((flags40_31 >> 12) & 0x1u) == 0) && (skip_alpha == 0);
-        if (r30 != 0) {
-          scan_fast::FastStoreU32(base, r30 + 40, scan_fast::FastLoadU32(base, r30 + 40) | 4096u);
-          if (f0 < f16) {
-            f0 = f0 * f24;
-          } else {
-            if (skip_alpha == 0) {
-              scan_fast::FastStoreU8(base, r30 + 99, float_to_alpha_byte(((f27 - f0) * f24) * f26));
-            }
-            f0 = f27;
-          }
-          f0 = f0 * f26;
-          if (!can_write_31_alpha) continue;
-          const float cur99 = float(scan_fast::FastLoadU8(base, r31 + 99));
-          if (f0 >= cur99) f0 = cur99;
-          scan_fast::FastStoreU8(base, r31 + 99, float_to_alpha_byte(f0));
-          continue;
-        } else {
-          const float cur99 = float(scan_fast::FastLoadU8(base, r31 + 99));
-          f0 = f0 * f26;
-          if (!can_write_31_alpha) continue;
-          if (f0 >= cur99) f0 = cur99;
-          scan_fast::FastStoreU8(base, r31 + 99, float_to_alpha_byte(f0));
-          continue;
-        }
-      }
-    }
-
-    clear_parent_fade(r30);
-    if ((f30 - mult12708_plus_f28) < f0) {
-      if (r10_flag != 0 || !enable_lod_mark) {
-        scan_fast::FastStoreU32(base, r27, 0);
-        continue;
-      }
-      const float lim = lod_dist_raw * mult2340;
-      if ((f30 - f28) < lim) continue;
-      scan_fast::FastStoreU32(base, r31 + 8, scan_fast::FastLoadU32(base, r31 + 8) | 0x40000000u);
-      scan_fast::FastStoreU32(base, r31 + 12, scan_fast::FastLoadU32(base, r31 + 12) | 0x40000000u);
-      continue;
-    }
-    scan_fast::FastStoreU32(base, r27, 0);
-  }
-
-  restore_and_return();
+[[gnu::always_inline]] inline uint32_t GetEntityPosAddr(uint8_t* base, uint32_t entity) noexcept {
+    const uint32_t mat = REX_LOAD_U32(entity + 32u);
+    return (mat != 0u) ? (mat + 48u) : (entity + 16u);
 }
+
+[[gnu::always_inline]] inline void ResetLodParentFade(uint8_t* base, uint32_t lod_parent) noexcept {
+    const uint32_t lf40 = REX_LOAD_U32(lod_parent + 40u);
+    if ((lf40 & 0x1000u) != 0u) {
+        REX_STORE_U8(lod_parent + 99u, 255u);
+    }
+    REX_STORE_U32(lod_parent + 40u, lf40 & ~0x1000u);
+}
+
+// Fully inlined sub_823B32E0: checks parent / grandparent LOD streaming & clears target->flags92 bit 2
+[[gnu::always_inline]] inline uint32_t CheckLodStreamingFast(
+    uint8_t* base, uint32_t lod_parent, bool streaming_fade_enabled) noexcept
+{
+    if (!streaming_fade_enabled || lod_parent == 0u) [[likely]] {
+        return 0u;
+    }
+
+    constexpr uint32_t kAddrModelInfoArray = 0x82B3A1A0u; // 0x82B40000 - 24160
+
+    uint32_t target = 0u;
+    if ((REX_LOAD_U8(lod_parent + 36u) & 1u) != 0u &&
+        (REX_LOAD_U32(lod_parent + 40u) & 0x40u) == 0u) {
+        target = lod_parent;
+    } else {
+        const uint32_t lod_grand = REX_LOAD_U32(lod_parent + 76u);
+        if (lod_grand != 0u &&
+            (REX_LOAD_U8(lod_grand + 36u) & 1u) != 0u &&
+            (REX_LOAD_U32(lod_grand + 40u) & 0x40u) == 0u) {
+            target = lod_grand;
+        } else {
+            return 0u;
+        }
+    }
+
+    const int16_t  model_idx  = static_cast<int16_t>(REX_LOAD_U16(target + 46u));
+    const uint32_t model_info = REX_LOAD_U32(
+        kAddrModelInfoArray + (static_cast<uint32_t>(static_cast<int32_t>(model_idx)) << 2));
+    if ((REX_LOAD_U32(model_info + 64u) & 0x8u) == 0u) {
+        return 0u;
+    }
+
+    const uint16_t flags92 = REX_LOAD_U16(target + 92u);
+    const uint8_t  alpha99 = REX_LOAD_U8(target + 99u);
+    REX_STORE_U16(target + 92u, static_cast<uint16_t>(flags92 & 0xFFFBu));
+
+    return (alpha99 >= 239u) ? 1u : 0u;
+}
+
+// Devirtualized model_info->vtable[3] (+12): GetModelType()
+[[gnu::always_inline]] inline uint32_t GetModelTypeFast(
+    uint8_t* base, uint32_t model_info, PPCContext& ctx) noexcept
+{
+    const uint32_t vtbl = REX_LOAD_U32(model_info);
+    const uint32_t fn   = REX_LOAD_U32(vtbl + 12u);
+
+    if (fn == 0x826041E8u) [[likely]] { ctx.r3.u64 = 1u; return 1u; } // CBaseModelInfo (>90%)
+    if (fn == 0x821C04B8u)            { ctx.r3.u64 = 6u; return 6u; } // CVehicleModelInfo
+    if (fn == 0x82174080u)            { ctx.r3.u64 = 5u; return 5u; } // CPedModelInfo
+    if (fn == 0x82175518u)            { ctx.r3.u64 = 3u; return 3u; } // CTimeModelInfo
+    if (fn == 0x82175650u)            { ctx.r3.u64 = 2u; return 2u; } // CMloModelInfo
+
+    ctx.r3.u64 = model_info;
+    ctx.lr     = 0x821D63E8u;
+    REX_CALL_INDIRECT_FUNC(fn);
+    return ctx.r3.u32 & 0xFFu;
+}
+
+// entity->vtable[21] (+84): GetBoundRadius() returning double in ctx.f1.f64
+[[gnu::always_inline]] inline double GetEntityBoundRadius(
+    uint8_t* base, uint32_t entity, PPCContext& ctx) noexcept
+{
+    const uint32_t fn = REX_LOAD_U32(REX_LOAD_U32(entity) + 84u);
+    ctx.r3.u64 = entity;
+    ctx.lr     = 0x821D6548u;
+    REX_CALL_INDIRECT_FUNC(fn);
+    return ctx.f1.f64;
+}
+
+} // namespace scan_entities_v3_detail
+
+extern "C" void sub_821D6260(PPCContext& ctx, uint8_t* base) {
+    if (!IsNativeMode()) {
+        __imp__sub_821D6260(ctx, base);
+        return;
+    }
+    using namespace scan_entities_v3_detail;
+
+    constexpr uint32_t kAddrScanCounter       = 0x82B85390u;
+    constexpr uint32_t kAddrModelInfoPtrs     = 0x82B3A1A0u;
+    constexpr uint32_t kAddrStreamingFadeEn   = 0x830328E0u; // 0x83030000 (-2096955392) + 10464
+    constexpr uint32_t kAddrGlobalFlag8303    = 0x83032953u; // 0x83030000 + 10579
+    constexpr uint32_t kAddrGlobalInt82AA     = 0x82AA89ECu;
+    constexpr uint32_t kAddrGlobalByte82B9    = 0x82B98462u;
+    constexpr uint32_t kAddrGlobalFloat82A9A4 = 0x82A931A4u;
+    constexpr uint32_t kAddrGlobalFloat82A9B8 = 0x82A931B8u;
+
+    const uint32_t begin_addr    = ctx.r3.u32;
+    const uint32_t end_addr      = ctx.r4.u32;
+    const uint32_t viewport_addr = ctx.r5.u32;
+
+    // 1. Pre-scan hook
+    ctx.lr = 0x821D6284u;
+    sub_821D0478(ctx, base);
+
+    // Exact PPC order: load viewport+2336 BEFORE begin_addr >= end_addr check
+    const float vp_lod_f23 = LoadF32BE(base, viewport_addr + 2336u);
+    REX_STORE_U32(kAddrScanCounter, REX_LOAD_U32(kAddrScanCounter) + 1u);
+
+    const bool pre_scan_zero = ((ctx.r3.u32 & 0xFFu) == 0u);
+    if (begin_addr >= end_addr) {
+        return;
+    }
+
+    // 2. Exact PPC pre-loop volatile GPR setup (preserves Live-Out ctx.r3 if loop body skips all)
+    ctx.r3.s64  = -2113798144LL;
+    ctx.r4.s64  = -2113929216LL;
+    ctx.r5.s64  = -2113929216LL;
+    ctx.r6.s64  = -2113929216LL;
+    ctx.r7.s64  = -2113142784LL;
+    ctx.r8.s64  = -2113929216LL;
+    ctx.r9.s64  = -2113929216LL;
+    ctx.r10.s64 = -2113929216LL;
+    ctx.r11.s64 = -2102132736LL;
+
+    // Hoist all 12 .rdata constants + 6 loop-invariant renderer globals + vp_scale
+    const float c_f26 = LoadF32BE(base, 0x820BEDD4u);
+    const float c_f24 = LoadF32BE(base, 0x82000DC8u);
+    const float c_f16 = LoadF32BE(base, 0x82000D74u);
+    const float c_f27 = LoadF32BE(base, 0x82000D48u);
+    const float c_f20 = LoadF32BE(base, 0x82019670u);
+    const float c_f21 = LoadF32BE(base, 0x8200251Cu);
+    const float c_f22 = LoadF32BE(base, 0x82002518u);
+    const float c_f17 = LoadF32BE(base, 0x82000A34u);
+    const float c_f18 = LoadF32BE(base, 0x820BECD8u);
+    const float c_f28 = LoadF32BE(base, 0x82000E0Cu);
+    const float c_f25 = IsNativeMode()
+        ? gta4::draw_distance::ResolveRemapLimit(scan_fast::FastLoadF32(base, kDistanceScaleInputGlobal))
+        : LoadF32BE(base, 0x82002514u);
+    const float c_f19 = LoadF32BE(base, 0x82002510u);
+
+    const bool  streaming_fade_enabled = (REX_LOAD_U32(kAddrStreamingFadeEn) != 0u);
+    const bool  lod_parent_filter_on   = (REX_LOAD_U8(kAddrGlobalFlag8303) != 0u) &&
+                                         (static_cast<int32_t>(REX_LOAD_U32(kAddrGlobalInt82AA)) > 0);
+    const bool  allow_fade_write       = (REX_LOAD_U8(kAddrGlobalByte82B9) == 0u);
+    const float extra_cull_dist        = LoadF32BE(base, kAddrGlobalFloat82A9A4);
+    const float radius_mult_f0         = LoadF32BE(base, kAddrGlobalFloat82A9B8);
+    const float vp_scale               = LoadF32BE(base, viewport_addr + 2340u);
+
+    // Lazily hoist camera position on first distance calculation (zero spurious OOB)
+    bool cam_pos_loaded = false;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    float32x4_t cam_pos{};
+#else
+    Vec4F32 cam_pos{};
+#endif
+    auto get_cam_pos = [&]() noexcept {
+        if (!cam_pos_loaded) [[unlikely]] {
+            cam_pos = LoadGuestVec4BE(base, viewport_addr + 2304u);
+            cam_pos_loaded = true;
+        }
+        return cam_pos;
+    };
+
+    // 3. Main entity visibility, distance sort & LOD alpha fade loop
+    for (uint32_t entry_ptr = begin_addr; entry_ptr < end_addr; entry_ptr += 8u) {
+        if (entry_ptr + 32u < end_addr) {
+            __builtin_prefetch(REX_RAW_ADDR(entry_ptr + 32u), 0, 1);
+        }
+
+        const uint32_t entity = REX_LOAD_U32(entry_ptr);
+        if (entity == 0u) {
+            continue;
+        }
+
+        const uint32_t lod_parent = REX_LOAD_U32(entity + 76u);
+
+        // Inlined sub_823B32E0: LOD parent/grandparent streaming fade check (0 function calls)
+        const uint32_t stream_culled = CheckLodStreamingFast(base, lod_parent, streaming_fade_enabled);
+        ctx.r3.u64 = stream_culled;
+        if (stream_culled != 0u) [[unlikely]] {
+            REX_STORE_U32(entry_ptr, 0u);
+            const uint16_t f92 = REX_LOAD_U16(entity + 92u);
+            REX_STORE_U8(entity + 99u, 0u);
+            REX_STORE_U16(entity + 92u, static_cast<uint16_t>(f92 & 0xFFFBu));
+            continue;
+        }
+
+        // Hoisted global LOD parent filter
+        if (lod_parent_filter_on && lod_parent != 0u && (REX_LOAD_U8(lod_parent + 36u) & 1u) == 0u) {
+            REX_STORE_U32(entry_ptr, 0u);
+            continue;
+        }
+
+        // Cache flags36 & flags40 once for the entire iteration
+        const uint32_t flags36 = REX_LOAD_U32(entity + 36u);
+        if ((flags36 & 0x04000000u) == 0u) {
+            REX_STORE_U32(entry_ptr, 0u);
+            continue;
+        }
+        const uint32_t flags40 = REX_LOAD_U32(entity + 40u);
+        if ((flags40 & 0x00000100u) != 0u) {
+            REX_STORE_U32(entry_ptr, 0u);
+            continue;
+        }
+
+        // Deferred CBaseModelInfo lookup (only for entities that survive visibility & streaming culls)
+        const int16_t  model_idx  = static_cast<int16_t>(REX_LOAD_U16(entity + 46u));
+        const uint32_t model_info = REX_LOAD_U32(
+            kAddrModelInfoPtrs + (static_cast<uint32_t>(static_cast<int32_t>(model_idx)) << 2));
+
+        // Devirtualized model_info->GetModelType() (0 indirect jumps for 5 standard RAGE model types)
+        const uint32_t model_type = GetModelTypeFast(base, model_info, ctx);
+
+        // --- Branch A: model_type == 5 (Ped) ---
+        if (model_type == 5u) {
+            if ((flags36 & 0x00080000u) == 0u) {
+                continue;
+            }
+            const auto pos = LoadGuestVec4BE(base, GetEntityPosAddr(base, entity));
+            StoreF32BE(base, entry_ptr + 4u, Distance3D_ZYX(pos, get_cam_pos()));
+            continue;
+        }
+
+        // --- Branch B: model_type == 6 (Vehicle) ---
+        if (model_type == 6u) {
+            if ((flags36 & 0x00000040u) != 0u) {
+                const uint32_t p120 = REX_LOAD_U32(entity + 120u);
+                if (p120 == 0u || (REX_LOAD_U8(p120) & 0x40u) == 0u) {
+                    REX_STORE_U32(entry_ptr, 0u);
+                    continue;
+                }
+            }
+            if ((flags36 & 0x00080000u) == 0u) {
+                continue;
+            }
+
+            const auto pos = LoadGuestVec4BE(base, GetEntityPosAddr(base, entity));
+            float dist = Distance3D_YZX(pos, get_cam_pos());
+            StoreF32BE(base, entry_ptr + 4u, dist);
+
+            if ((flags40 & 0x03C00000u) == 0x00C00000u &&
+                (REX_LOAD_U32(entity + 572u) & 0x20000000u) != 0u) {
+                const uint32_t p2688 = REX_LOAD_U32(entity + 2688u);
+                if (p2688 != 0u) {
+                    const uint32_t fn_rad = REX_LOAD_U32(REX_LOAD_U32(p2688) + 84u);
+                    ctx.r3.u64 = p2688;
+                    ctx.lr     = 0x821D688Cu;
+                    REX_CALL_INDIRECT_FUNC(fn_rad);
+                    dist = static_cast<float>(ctx.f1.f64 + static_cast<double>(dist));
+                    StoreF32BE(base, entry_ptr + 4u, dist);
+                }
+            }
+
+            const uint32_t fn_v36 = REX_LOAD_U32(REX_LOAD_U32(entity) + 36u);
+            ctx.r3.u64 = entity;
+            ctx.lr     = 0x821D68ACu;
+            REX_CALL_INDIRECT_FUNC(fn_v36);
+            if ((ctx.r3.u32 & 0xFFu) == 0u) {
+                continue;
+            }
+
+            ctx.r3.u64 = entity;
+            ctx.lr     = 0x821D68C0u;
+            sub_821E5278(ctx, base);
+            const uint32_t aux_obj = ctx.r3.u32;
+            if (aux_obj == 0u) {
+                continue;
+            }
+
+            const uint32_t fn_aux = REX_LOAD_U32(REX_LOAD_U32(aux_obj) + 84u);
+            ctx.r3.u64 = aux_obj;
+            ctx.lr     = 0x821D68D8u;
+            REX_CALL_INDIRECT_FUNC(fn_aux);
+            dist = static_cast<float>(ctx.f1.f64 + static_cast<double>(dist));
+            StoreF32BE(base, entry_ptr + 4u, dist);
+            continue;
+        }
+
+        // --- Branch C: Standard Entities (Buildings, Props, LODs — >90% of city scene) ---
+        const uint32_t pos_owner = (lod_parent != 0u) ? lod_parent : entity;
+        const auto     owner_pos = LoadGuestVec4BE(base, GetEntityPosAddr(base, pos_owner));
+        const auto     cam       = get_cam_pos();
+
+        const float entity_lod_dist = LoadF32BE(base, entity + 80u);
+        float f29 = entity_lod_dist;
+        float f30 = Distance3D_ZYX(owner_pos, cam);
+
+        const uint32_t is_lo_lod = (flags36 >> 24) & 1u;
+        if (is_lo_lod != 0u && vp_lod_f23 > c_f19) {
+            f29 = vp_lod_f23;
+        }
+
+        const float f31 = vp_scale * f29;
+
+        if ((flags36 & 0x02000000u) == 0u) {
+            if (f30 > c_f25 && f31 > c_f25 && f30 < (f31 + c_f28)) {
+                f30 = (f31 - c_f25) + f30;
+            }
+        }
+
+        const float sort_bias = (is_lo_lod != 0u) ? c_f18 : c_f17;
+        float sort_dist;
+        if (lod_parent != 0u) {
+            const auto self_pos = LoadGuestVec4BE(base, GetEntityPosAddr(base, entity));
+            sort_dist = Distance3D_ZYX(self_pos, cam) + sort_bias;
+        } else {
+            sort_dist = sort_bias + f30;
+        }
+        StoreF32BE(base, entry_ptr + 4u, sort_dist);
+
+        // entity->vtable[21] (+84): GetBoundRadius()
+        const double bound_rad = GetEntityBoundRadius(base, entity, ctx);
+
+        float f0  = static_cast<float>(bound_rad + static_cast<double>(vp_lod_f23));
+        float f13 = c_f28;
+        f0 = ((f31 - f0) >= 0.0f) ? f0 : f31;
+
+        if (lod_parent == 0u) {
+            const float f12 = ((f29 - f0) >= 0.0f) ? f0 : f29;
+            if (f12 > c_f22) {
+                f13 = std::fmaf(f12, c_f21, c_f20);
+            }
+            if ((flags36 & 0x02000000u) != 0u) {
+                f0 = radius_mult_f0 * f0;
+            }
+        }
+
+        const uint32_t can_fade = (REX_LOAD_U32(model_info + 64u) >> 3) & 1u;
+        if (can_fade != 0u) {
+            const float f12 = (f13 + f30) - c_f28;
+            if (f12 < f31) {
+                if (lod_parent != 0u) {
+                    ResetLodParentFade(base, lod_parent);
+                }
+                continue;
+            }
+
+            if ((f30 - c_f28) < f31) {
+                float t = ((f0 + c_f28) - f30) / f13;
+                t = ((t - c_f27) >= 0.0f) ? c_f27 : t;
+
+                if (lod_parent != 0u) {
+                    const uint32_t lf40 = REX_LOAD_U32(lod_parent + 40u);
+                    REX_STORE_U32(lod_parent + 40u, lf40 | 0x1000u);
+                    if (t < c_f16) {
+                        t = t * c_f24;
+                    } else {
+                        if (allow_fade_write) {
+                            const float lod_alpha = ((c_f27 - t) * c_f24) * c_f26;
+                            REX_STORE_U8(lod_parent + 99u, static_cast<uint8_t>(PpcFctiwz(lod_alpha)));
+                        }
+                        t = c_f27;
+                    }
+                }
+
+                const float alpha_f = t * c_f26;
+                if ((flags40 & 0x1000u) == 0u && allow_fade_write) {
+                    const float cur_a = static_cast<float>(REX_LOAD_U8(entity + 99u));
+                    const float min_a = ((alpha_f - cur_a) >= 0.0f) ? cur_a : alpha_f;
+                    REX_STORE_U8(entity + 99u, static_cast<uint8_t>(PpcFctiwz(min_a)));
+                }
+                continue;
+            }
+        }
+
+        // loc_821D66F8: Far distance cull / LOD streaming flag
+        if ((f30 - (extra_cull_dist + c_f28)) < f0) {
+            if (lod_parent != 0u) {
+                ResetLodParentFade(base, lod_parent);
+            }
+            if (can_fade != 0u || !pre_scan_zero) {
+                REX_STORE_U32(entry_ptr, 0u);
+                continue;
+            }
+            const float max_d = entity_lod_dist * vp_scale;
+            if (!((f30 - c_f28) < max_d)) {
+                REX_STORE_U32(entity + 8u,  REX_LOAD_U32(entity + 8u)  | 0x40000000u);
+                REX_STORE_U32(entity + 12u, REX_LOAD_U32(entity + 12u) | 0x40000000u);
+            }
+            continue;
+        }
+
+        // loc_821D678C: Entity culled
+        if (lod_parent != 0u) {
+            ResetLodParentFade(base, lod_parent);
+        }
+        REX_STORE_U32(entry_ptr, 0u);
+    }
+}
+
 
 extern "C" void sub_821D8CD8(PPCContext& ctx, uint8_t* base) {
   if (!IsNativeMode()) {

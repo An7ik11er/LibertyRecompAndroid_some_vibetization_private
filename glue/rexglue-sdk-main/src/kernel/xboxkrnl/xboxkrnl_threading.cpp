@@ -573,7 +573,7 @@ void NoteSleepZero() {
   CurrentYieldCounter().sleep0.fetch_add(1, std::memory_order_relaxed);
 }
 
-// Guest threads start as "XThreadXXXX" and are renamed (RenderGuest, RageStream...) a moment
+// Guest threads start as "XThreadXXXX" and are renamed (RenderGuest, RageAudioCtrl...) a moment
 // later; a counter created in between would keep the old name. Re-read it from /proc
 // (never through pthread_t: the thread may have exited).
 void RefreshCounterName(YieldCounter* counter) {
@@ -600,7 +600,7 @@ void RefreshCounterName(YieldCounter* counter) {
 }  // namespace
 
 // Per thread: yields / spinlock rounds / ms waiting on spinlocks / Sleep(0) calls,
-// e.g. "RageStream=0/26246/12.3ms/z5100". Sorted by spinlock wait time.
+// e.g. "RageAudioCtrl=0/26246/12.3ms/z5100". Sorted by spinlock wait time.
 std::string TakeYieldCountSummary(size_t max_threads) {
   struct Delta {
     std::string name;

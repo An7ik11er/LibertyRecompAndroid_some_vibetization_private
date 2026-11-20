@@ -161,7 +161,7 @@ final class LauncherI18n {
         // Affinity Groups & Threads
         RU.put("grp_render", "Рендеринг (основные потоки)");
         RU.put("grp_audio", "Аудио");
-        RU.put("grp_world", "Стриминг мира и чтение файлов");
+        RU.put("grp_world", "Файловый ввод-вывод и задачи ядра");
         RU.put("grp_jobs", "Игровые задачи и физика");
         RU.put("grp_background", "Фоновые процессы");
 
@@ -175,7 +175,7 @@ final class LauncherI18n {
         RU.put("th_host_audio_hint", "Вывод звука Android (управляется AAudio, без привязки)");
         RU.put("th_xma_decoder_hint", "Декодер сжатого звука");
         RU.put("th_audio_worker_hint", "Коллбэки XAudio для каждого кадра");
-        RU.put("th_rage_stream_hint", "Подгрузка города вокруг игрока");
+        RU.put("th_rage_audio_ctrl_hint", "Контроллер 3D-звука RAGE (позиционирование и затухание)");
         RU.put("th_rage_fileio_hint", "Чтение игровых файлов с накопителя");
         RU.put("th_kernel_io_hint", "Фоновые задачи эмулируемого ядра Xbox");
         RU.put("th_rage_jobs_hint", "Анимации, искусственный интеллект и задачи движка");

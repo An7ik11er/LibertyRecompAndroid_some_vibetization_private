@@ -845,5 +845,6 @@ GEMINI.md
 CLAUDE.md
 .agents/
 tools/agent_tools/
+tools/archive_scratch/
 
 

@@ -208,7 +208,7 @@ uint32_t AutoMask(Kind kind, const CpuTopology& t) {
 enum ThreadId : uint8_t {
   kRenderGuest, kRecorder, kRenderWork, kMainXThread, kSdlThread, kSdlHelpers,
   kAudioGuest, kHostAudio, kXmaDecoder, kAudioWorker,
-  kRageStream, kRageFileIO, kKernelIO,
+  kRageAudioCtrl, kRageFileIO, kKernelIO,
   kRageJobs, kRagePhysics, kRageOther, kRageSim,
   kCmdRetirer, kRecorderHelpers, kSdlActivity, kBackground,
   kBackend,  // 47: GtaBackend (gta4_native_backend_thread): render worker + frame recording
@@ -228,14 +228,14 @@ struct Rule {
 constexpr std::array<const char*, kThreadIdCount> kIds = {{
     "render_guest", "recorder", "render_work", "main_xthread", "sdl_thread", "sdl_helpers",
     "audio_guest", "host_audio", "xma_decoder", "audio_worker",
-    "rage_stream", "rage_fileio", "kernel_io",
+    "rage_audio_ctrl", "rage_fileio", "kernel_io",
     "rage_jobs", "rage_physics", "rage_other", "rage_sim",
     "cmd_retirer", "recorder_helpers", "sdl_activity", "background",
     "backend", "capture",
 }};
 
 // «Полосы». Нагрузка по оверлею 888 (26.10, % одного ядра): AudioGuest 37, RenderGuest 35,
-// GtaRecorder 32 (до ~100 на 855), GtaCmdRetirer 26, GtaRenderWork 23, XMA 18, RageStream 18,
+// GtaRecorder 32 (до ~100 на 855), GtaCmdRetirer 26, GtaRenderWork 23, XMA 18, RageAudioCtrl 18,
 // Main XThread 18, SDLThread 11.
 //   855/888: рекордер {6,7}; RenderGuest/Main {4-7}; RenderWork {4-6}; аудио {4,5};
 //            задачи игры {0-5}; сервисы {0-3}.
@@ -254,9 +254,10 @@ constexpr std::array<Rule, kThreadIdCount> kLanes = {{
     {Kind::kNone, kKeepNice, false},    // host_audio — не трогаем
     {Kind::kAudioLane, -16, true},      // xma_decoder
     {Kind::kAudioLane, -16, true},      // audio_worker
-    // 43: +2. World streaming (strStreaming), ~55 % of a Little core while driving, nobody
-    // waits for it within a frame; it delayed the physics workers on the same cores.
-    {Kind::kLittle, 2, false},          // rage_stream
+    // rage::audController (0x82902728, formerly misnamed "RageStream"): 3D audio positioning/panning.
+    // ~43% of a Little core; nobody waits for it synchronously within a frame, so keep on Little +2
+    // so it doesn't crowd Big cores needed by Main XThread / AudioGuest / GtaRenderWork.
+    {Kind::kLittle, 2, false},          // rage_audio_ctrl
     {Kind::kLittle, kKeepNice, false},  // rage_fileio
     {Kind::kLittle, -2, false},         // kernel_io
     {Kind::kJobsLane, -2, false},       // rage_jobs (ждёт главный поток игры)
@@ -266,7 +267,7 @@ constexpr std::array<Rule, kThreadIdCount> kLanes = {{
     {Kind::kLittle, 0, false},          // rage_other
     // 41: Rage_1BA088 (entry 0x821BA088, physics/simulation code 0x827A-0x8281). Main
     // XThread waits for it 3.4 ms a frame (30.10 20:16, 888); it ran 100 % on Little at
-    // nice 0 next to RageStream (55 % of a Little core). Same lane as the job pools.
+    // nice 0 next to RageAudioCtrl (~43 % of a Little core). Same lane as the job pools.
     {Kind::kJobsLane, -6, false},       // rage_sim
     {Kind::kLittle, 0, false},          // cmd_retirer
     {Kind::kLittle, 10, false},         // recorder_helpers
@@ -294,7 +295,7 @@ constexpr std::array<Rule, kThreadIdCount> kClusters = {{
     {Kind::kNone, kKeepNice, false},    // host_audio
     {Kind::kWorkers, -16, true},        // xma_decoder
     {Kind::kWorkers, -16, true},        // audio_worker
-    {Kind::kWorkers, 0, false},         // rage_stream
+    {Kind::kWorkers, 0, false},         // rage_audio_ctrl
     {Kind::kLittle, kKeepNice, false},  // rage_fileio
     {Kind::kWorkers, -2, false},        // kernel_io
     {Kind::kLittleBig, -2, false},      // rage_jobs
@@ -387,6 +388,8 @@ ThreadId Classify(const std::string& name, pid_t tid, pid_t primary_recorder, pi
   if (Has(name, "Track") || Has(name, "SDLAudio")) return kHostAudio;
   if (name == "AudioGuest") return kAudioGuest;
   if (Has(name, "XMA")) return kXmaDecoder;
+  // Must precede Has(name, "Audio"): 0x82902728 stays in its own lane on Little +2.
+  if (name == "RageAudioCtrl" || name == "RageStream") return kRageAudioCtrl;
   if (Has(name, "Audio")) return kAudioWorker;
   // 46/47: GtaBackend (gta4_native_backend_thread) is the render worker that also records
   // the frame: its own id "backend" (Prime only by default). Threads it starts inherit
@@ -407,7 +410,6 @@ ThreadId Classify(const std::string& name, pid_t tid, pid_t primary_recorder, pi
     return kBackground;
   if (name == "SDLThread") return tid == primary_sdl ? kSdlThread : kSdlHelpers;
   if (name == "SDLActivity") return kSdlActivity;
-  if (name == "RageStream") return kRageStream;
   if (name == "Rage_1BA088") return kRageSim;  // 41
   if (Starts(name, "Rage") || Starts(name, "XThread")) return kRageOther;
   return kUnknown;
@@ -421,6 +423,7 @@ struct Placement {
 };
 
 int FindThreadId(const std::string& id) {
+  if (id == "rage_stream") return kRageAudioCtrl;  // legacy alias
   for (int i = 0; i < kThreadIdCount; ++i)
     if (id == kIds[i]) return i;
   return -1;

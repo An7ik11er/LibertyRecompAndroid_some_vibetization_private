@@ -163,7 +163,7 @@ bool Gta4NativeGraphicsSystem::StreamSubmit(RefreshContext* context) {
   if (active_frame_slot_ < frame_constant_arenas_.size()) {
     const VkDeviceSize used =
         VkDeviceSize(frame_constant_arenas_[active_frame_slot_].index.bytes_used());
-    constexpr VkDeviceSize kStreamConstantArenaFloor = VkDeviceSize(32) << 20;
+    constexpr VkDeviceSize kStreamConstantArenaFloor = VkDeviceSize(16) << 20;
     stream_constant_reserve_ =
         std::max({used, stream_constant_reserve_ - stream_constant_reserve_ / 16, kStreamConstantArenaFloor});
   }

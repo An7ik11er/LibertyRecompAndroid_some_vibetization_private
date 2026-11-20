@@ -8,6 +8,26 @@
 #include <rex/graphics/gta4_native/lighting_semantics.h>
 #include <rex/graphics/gta4_native/forward_stencil.h>
 
+namespace gta4::vk_direct {
+
+constexpr uint32_t kDirectDrawFlagVdeclChanged = 1u << 0;
+constexpr uint32_t kDirectDrawFlagHasStream1   = 1u << 1;
+constexpr uint32_t kDirectDrawFlagPrimRestart  = 1u << 2;
+
+struct alignas(32) RageDirectDrawPacket {
+  uint32_t d3d_vdecl_addr; // Guest ptr IDirect3DVertexDeclaration9*
+  uint32_t d3d_vb_addr;    // Guest ptr IDirect3DVertexBuffer9*
+  uint32_t d3d_ib_addr;    // Guest ptr IDirect3DIndexBuffer9*
+  uint32_t d3d_prim_type;  // D3DPRIMITIVETYPE from hardware table 0x82B0B4F4
+  uint32_t vertex_stride;  // vb->vertex_stride (+0x0C)
+  uint32_t index_count;    // Signed clamp(r7, ib->index_count)
+  uint32_t rage_draw_mode; // Original r3 (grcDrawMode)
+  uint32_t flags;          // bit 0: vdecl_changed, bit 1: has_stream1, bit 2: prim_restart
+};
+static_assert(sizeof(RageDirectDrawPacket) == 32, "Must be 32 bytes");
+
+}  // namespace gta4::vk_direct
+
 namespace rex::graphics::gta4_native {
 
 inline constexpr uint32_t kTitleId = 0x545407F2;
@@ -356,6 +376,20 @@ struct DrawIndexedPrimitiveCommand {
   uint32_t batch_vb1 = 0;
   uint32_t batch_stride1 = 0;
 };
+
+// Packed cross-DSO ABI wrapper (96 bytes total, 0 wasted gap before 32B-aligned pkt).
+struct RageDirectDrawCommand {
+  CommandHeader header{sizeof(RageDirectDrawCommand), CommandType::kDrawIndexedPrimitive};
+  uint32_t device{};
+  uint32_t caller{};
+  uint32_t prim_restart_index{};
+  uint32_t batch_vb1{};
+  uint32_t batch_stride1{};
+  ::gta4::vk_direct::RageDirectDrawPacket pkt{};
+  NativeDirtyState dirty_state{};
+};
+static_assert(sizeof(RageDirectDrawCommand) != sizeof(DrawIndexedPrimitiveCommand),
+              "SubmitTitleCommand dispatches by command_size; sizes must remain distinct");
 
 template <typename DrawCommand>
 void ApplyDrawLightingContext(DrawCommand& command, const LightingContext& context) {

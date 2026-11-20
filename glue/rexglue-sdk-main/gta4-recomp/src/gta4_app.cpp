@@ -218,7 +218,7 @@ REXCVAR_DEFINE_STRING(gta4_native_smaa_quality, "high", "GTA IV/Graphics/Anti-Al
                       "SMAA 1x preset: low, medium, high, or ultra")
     .allowed({"low", "medium", "high", "ultra"});
 REXCVAR_DEFINE_STRING(gta4_native_upscaler, "native", "GTA IV/Graphics/Upscaling",
-                      "Output upscaler: native, fsr1, sgsr, MetalFX, FSR 3.1, or DLSS; temporal modes require backend support")
+                      "Output upscaler: native, fsr1, sgsr (Snapdragon Game Super Resolution), MetalFX, FSR 3.1, or DLSS; temporal modes require backend support")
     .allowed({"native", "fsr1", "sgsr", "metalfx", "fsr3", "dlss"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(gta4_temporal_upscaler_quality, "quality", "GTA IV/Graphics/Upscaling",
@@ -231,8 +231,7 @@ REXCVAR_DEFINE_STRING(gta4_fsr1_quality, "quality", "GTA IV/Graphics/Upscaling",
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_DOUBLE(gta4_fsr1_sharpness_reduction, 0.2, "GTA IV/Graphics/Upscaling",
                       "FSR 1 RCAS sharpness reduction in stops")
-    .range(0.0, 2.0)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .range(0.0, 2.0);
 // SGSR: настройка резкости краёв (от 1.0 до 2.0)
 REXCVAR_DEFINE_DOUBLE(gta4_sgsr_sharpness, 2.0, "GTA IV/Graphics/Upscaling",
                       "SGSR edge sharpness")

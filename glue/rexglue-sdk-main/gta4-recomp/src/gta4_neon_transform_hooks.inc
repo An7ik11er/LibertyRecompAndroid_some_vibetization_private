@@ -1,5 +1,5 @@
 // ARM64 NEON Vector Transform Hooks for GTA IV (Rockstar RAGE engine)
-// Accelerates sub_829046A0 and sub_82904740 (Top hot matrix-vector math in RageStream).
+// Accelerates sub_829046A0 and sub_82904740 (Top hot matrix-vector math in RageAudioCtrl / rage::audController, formerly RageStream).
 #pragma once
 
 #if defined(__aarch64__)

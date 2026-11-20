@@ -374,166 +374,152 @@ inline void OptSub821BD0A0(PPCContext& ctx, uint8_t* base) {
 
 
 inline void OptSub821BE8A0(PPCContext& ctx, uint8_t* base) {
-    REX_FUNC_PROLOGUE();
+    constexpr uint32_t kAddrZeroFloat    = 0x82000A34u; // 0x82000000 + 2612
+    constexpr uint32_t kAddrEffectCtx    = 0x82B36E90u; // 0x82B30000 (-2102198272) + 28304
+    constexpr uint32_t kAddrViewportCur  = 0x831C2200u; // 0x831C0000 + 8704
+    constexpr uint32_t kAddrFlag831C2F62 = 0x831C2F62u; // 0x831C0000 + 12114
 
+    const uint64_t saved_r1 = ctx.r1.u64;
 
-    const int32_t bone_tag = ctx.r3.s32; // r11
-    if (bone_tag <= -1) {
+    const int32_t  bone_idx_s32 = ctx.r3.s32;
+    const uint32_t bone_idx_u32 = ctx.r3.u32;
+    const uint32_t owner_ea     = ctx.r4.u32;
+    const uint64_t arg_r5_u64   = ctx.r5.u64;
+    const uint64_t mask_r6_u64  = ctx.r6.u64;
+    const uint64_t arg_r7_u64   = ctx.r7.u64;
+    const uint32_t mode_r8_u32  = ctx.r8.u32;
+
+    const uint32_t frame_r1 = static_cast<uint32_t>(saved_r1) - 192u;
+    ctx.r1.u32 = frame_r1;
+
+    // 1. Preserve exact PPC load order for owner+8 (OOB/guard parity) & bone index gate
+    const uint32_t owner_f8 = REX_LOAD_U32(owner_ea + 8u);
+    if (bone_idx_s32 <= -1) {
+        ctx.r1.u64 = saved_r1;
         return;
     }
 
-
-    // sld r10, r9, r10: в PowerPC сдвиг 64-битного слова обнуляется, если бит 6 (0x40) установлен
-    const uint32_t shift_amt = static_cast<uint32_t>(bone_tag);
-    const uint64_t bit_mask  = (shift_amt & 0x40u) ? 0ULL : (1ULL << (shift_amt & 0x3Fu));
-    if ((bit_mask & ctx.r6.u64) != 0ULL) {
+    // Exact PPC64 `sld r10, 1, extsw(r11)` semantics (shift count = r11 & 0x7F; >=64 -> 0)
+    const uint64_t bit_mask = ((bone_idx_u32 & 0x40u) != 0u)
+        ? 0ULL
+        : (1ULL << (bone_idx_u32 & 0x3Fu));
+    if ((bit_mask & mask_r6_u64) != 0ULL) {
+        ctx.r1.u64 = saved_r1;
         return;
     }
 
-
-    const uint32_t r29_init = REX_LOAD_U32(ctx.r4.u32 + 8u);
-    const uint32_t r27_val  = ctx.r7.u32;
-    const uint32_t r28_val  = ctx.r8.u32;
-
-
-    // lwz r10, 212(r29); rlwinm r11, r11, 2, 0, 29; lwzx r11, r10, r11
-    const uint32_t table_ptr = REX_LOAD_U32(r29_init + 212u);
-    const uint32_t entry_ptr = REX_LOAD_U32(table_ptr + (static_cast<uint32_t>(bone_tag) << 2));
-    const uint32_t r30_val   = REX_LOAD_U32(entry_ptr + 144u);
-    if (r30_val == 0u) {
+    const uint32_t bone_tbl   = REX_LOAD_U32(owner_f8 + 212u);
+    const uint32_t bone_entry = REX_LOAD_U32(bone_tbl + ((bone_idx_u32 << 2) & 0xFFFFFFFCu));
+    const uint32_t attach_obj = REX_LOAD_U32(bone_entry + 144u);
+    if (attach_obj == 0u) {
+        ctx.r1.u64 = saved_r1;
         return;
     }
 
-
-    ctx.fpscr.disableFlushMode();
-    // lis r10, -32256 (0x82000000); lfs f0, 2612(r10) -> 0x82000A34
-    const float f13_val = std::bit_cast<float>(REX_LOAD_U32(r30_val + 112u));
-    const float f0_zero = std::bit_cast<float>(REX_LOAD_U32(0x82000A34u));
-    if (f13_val == f0_zero) {
+    const float attach_f112 = std::bit_cast<float>(REX_LOAD_U32(attach_obj + 112u));
+    const float zero_f      = std::bit_cast<float>(REX_LOAD_U32(kAddrZeroFloat));
+    if (static_cast<double>(attach_f112) == static_cast<double>(zero_f)) {
+        ctx.r1.u64 = saved_r1;
         return;
     }
 
-
-    const uint32_t old_sp   = ctx.r1.u32;
-    const uint64_t saved_lr = ctx.lr;
-    const uint32_t sp       = old_sp - 192u;
-    ctx.r1.u32 = sp;
-
-
-    // lhz r11, 14(r11); extsh r31, r11
-    const int16_t  bone_idx_s16 = static_cast<int16_t>(REX_LOAD_U16(entry_ptr + 14u));
-    const int64_t  r31_s64      = static_cast<int64_t>(bone_idx_s16);
-    const uint64_t r31_u64      = static_cast<uint64_t>(r31_s64);
-
-
-    // Вызов sub_828CAF58(r3 = r5, r4 = sp + 80, r5 = r31)
-    ctx.r3.u64 = ctx.r5.u64;
-    ctx.r4.u64 = sp + 80u;
-    ctx.r5.u64 = r31_u64;
-    ctx.lr     = 0x821BE920;
+    // 2. Fetch bone world Matrix34 into stack frame [frame_r1 + 80 .. frame_r1 + 143]
+    const int32_t table_idx = static_cast<int16_t>(REX_LOAD_U16(bone_entry + 14u));
+    ctx.r3.u64 = arg_r5_u64;
+    ctx.r4.u64 = static_cast<uint64_t>(frame_r1 + 80u);
+    ctx.r5.u64 = static_cast<uint64_t>(static_cast<int64_t>(table_idx));
+    ctx.lr     = 0x821BE920u;
     sub_828CAF58(ctx, base);
 
+    // 3. Apply bone local offset vector `off_vec` (at bone_data + 96) to M[3] (`frame_r1 + 128`):
+    //    M[3] += { dot3(off_vec, ColX), dot3(off_vec, ColY), dot3(off_vec, ColZ), dot3(off_vec, ColX) }
+    //    Computed directly via row-scaling in exact ARM64 SIMDe pairwise dp_ps(0xEF) order (0 transposes!)
+    const uint32_t skel_ptr   = REX_LOAD_U32(owner_f8 + 180u);
+    const uint32_t skel_bones = REX_LOAD_U32(REX_LOAD_U32(skel_ptr + 12u));
+    const uint32_t off_vec_ea = (skel_bones + static_cast<uint32_t>(static_cast<int64_t>(table_idx) * 224LL) + 96u) & ~0xFu;
 
-    // Вычисление адреса кости: *(*(r29 + 180) + 12) + r31 * 224
-    const uint32_t skel_ptr1 = REX_LOAD_U32(r29_init + 180u);
-    const uint32_t skel_ptr2 = REX_LOAD_U32(skel_ptr1 + 12u);
-    const uint32_t bone_base = REX_LOAD_U32(skel_ptr2) + static_cast<uint32_t>(r31_u64 * 224ULL);
+#if defined(__aarch64__) || defined(_M_ARM64)
+    uint8_t* const    mat_ptr = REX_RAW_ADDR((frame_r1 + 80u) & ~0xFu);
+    const float32x4_t m0      = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(mat_ptr +  0u)));
+    const float32x4_t m1      = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(mat_ptr + 16u)));
+    const float32x4_t m2      = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(mat_ptr + 32u)));
+    const float32x4_t m3      = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(mat_ptr + 48u)));
+    const float32x4_t off_vec = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(REX_RAW_ADDR(off_vec_ea))));
 
+    const float32x4_t tx       = vmulq_laneq_f32(m0, off_vec, 0);
+    const float32x4_t ty       = vmulq_laneq_f32(m1, off_vec, 1);
+    const float32x4_t tz       = vmulq_laneq_f32(m2, off_vec, 2);
+    const float32x4_t delta    = vaddq_f32(vaddq_f32(vdupq_n_f32(0.0f), tz), vaddq_f32(tx, ty));
+    const float32x4_t d_packed = vcopyq_laneq_f32(delta, 3, delta, 0);
+    vst1q_u8(mat_ptr + 48u, vrev32q_u8(vreinterpretq_u8_f32(vaddq_f32(m3, d_packed))));
+#else
+    const float m0_x = std::bit_cast<float>(REX_LOAD_U32(frame_r1 +  80u));
+    const float m1_x = std::bit_cast<float>(REX_LOAD_U32(frame_r1 +  96u));
+    const float m2_x = std::bit_cast<float>(REX_LOAD_U32(frame_r1 + 112u));
+    const float m3_x = std::bit_cast<float>(REX_LOAD_U32(frame_r1 + 128u));
+    const float m3_y = std::bit_cast<float>(REX_LOAD_U32(frame_r1 + 132u));
+    const float m3_z = std::bit_cast<float>(REX_LOAD_U32(frame_r1 + 136u));
+    const float m3_w = std::bit_cast<float>(REX_LOAD_U32(frame_r1 + 140u));
+    const float off_x = std::bit_cast<float>(REX_LOAD_U32(off_vec_ea + 0u));
+    const float off_y = std::bit_cast<float>(REX_LOAD_U32(off_vec_ea + 4u));
+    const float off_z = std::bit_cast<float>(REX_LOAD_U32(off_vec_ea + 8u));
 
-    // Загрузка 4-х векторов матрицы из [sp + 80 .. sp + 128] и вектора смещения кости из [bone_base + 96]
-    const uint8x16_t mask_l = vld1q_u8(reinterpret_cast<const uint8_t*>(VectorMaskL));
+    const float dx = (0.0f + off_z * m2_x) + (off_x * m0_x + off_y * m1_x);
+    REX_STORE_U32(frame_r1 + 128u, std::bit_cast<uint32_t>(m3_x + dx));
+    REX_STORE_U32(frame_r1 + 132u, std::bit_cast<uint32_t>(m3_y));
+    REX_STORE_U32(frame_r1 + 136u, std::bit_cast<uint32_t>(m3_z));
+    REX_STORE_U32(frame_r1 + 140u, std::bit_cast<uint32_t>(m3_w + dx));
+#endif
 
-
-    const float32x4_t R0 = vreinterpretq_f32_u8(vqtbl1q_u8(
-        vld1q_u8(reinterpret_cast<const uint8_t*>(REX_RAW_ADDR((sp + 80u) & ~0xFu))), mask_l));
-    const float32x4_t R1 = vreinterpretq_f32_u8(vqtbl1q_u8(
-        vld1q_u8(reinterpret_cast<const uint8_t*>(REX_RAW_ADDR((sp + 96u) & ~0xFu))), mask_l));
-    const float32x4_t R2 = vreinterpretq_f32_u8(vqtbl1q_u8(
-        vld1q_u8(reinterpret_cast<const uint8_t*>(REX_RAW_ADDR((sp + 112u) & ~0xFu))), mask_l));
-    const float32x4_t R3 = vreinterpretq_f32_u8(vqtbl1q_u8(
-        vld1q_u8(reinterpret_cast<const uint8_t*>(REX_RAW_ADDR((sp + 128u) & ~0xFu))), mask_l));
-    const float32x4_t B  = vreinterpretq_f32_u8(vqtbl1q_u8(
-        vld1q_u8(reinterpret_cast<const uint8_t*>(REX_RAW_ADDR((bone_base + 96u) & ~0xFu))), mask_l));
-
-
-    ctx.fpscr.enableFlushMode();
-
-
-    // Прямое вычисление 3x3 трансформации + трансляции R3 за 4 инструкции NEON
-    const float32x4_t term1 = vmulq_laneq_f32(R2, B, 1);
-    const float32x4_t term2 = vmulq_laneq_f32(R1, B, 2);
-    const float32x4_t term3 = vmulq_laneq_f32(R0, B, 3);
-    float32x4_t acc = vaddq_f32(vaddq_f32(term1, term2), term3);
-
-
-    // В оригинале lane 0 перед сложением с R3 дублирует скалярное произведение из lane 3
-    acc = vsetq_lane_f32(vgetq_lane_f32(acc, 3), acc, 0);
-    const float32x4_t v0_res = vaddq_f32(R3, acc);
-
-
-    // Запись результата обратно в [sp + 128] и обновление ctx.v0, ctx.v13
-    vst1q_u8(reinterpret_cast<uint8_t*>(REX_RAW_ADDR((sp + 128u) & ~0xFu)),
-             vqtbl1q_u8(vreinterpretq_u8_f32(v0_res), mask_l));
-    vst1q_f32(ctx.v0.f32, v0_res);
-    vst1q_f32(ctx.v13.f32, R3);
-
-
-    // Проверка r30 + 64
-    const uint32_t ptr_64 = REX_LOAD_U32(r30_val + 64u);
-    if (ptr_64 == 0u) {
-        ctx.r1.u32 = old_sp;
-        ctx.lr     = saved_lr;
+    // 4. Resolve drawable / model target by mode_flag ((r8 & 0xFF) != 0 ? 1 : 0)
+    const uint32_t attach_f64 = REX_LOAD_U32(attach_obj + 64u);
+    if (attach_f64 == 0u) {
+        ctx.r1.u64 = saved_r1;
         return;
     }
 
-
-    const uint32_t sub_table  = REX_LOAD_U32(ptr_64);
-    const uint32_t sub_offset = ((r28_val & 0xFFu) != 0u) ? 4u : 0u;
-    const uint32_t r29_next   = REX_LOAD_U32(sub_table + sub_offset);
-    if (r29_next == 0u) {
-        ctx.r1.u32 = old_sp;
-        ctx.lr     = saved_lr;
+    const uint32_t mode_flag = ((mode_r8_u32 & 0xFFu) != 0u) ? 1u : 0u;
+    const uint32_t arr_head  = REX_LOAD_U32(attach_f64);
+    const uint32_t target_ea = REX_LOAD_U32(arr_head + (mode_flag << 2));
+    if (target_ea == 0u) {
+        ctx.r1.u64 = saved_r1;
         return;
     }
 
-
-    // lis r11, -31972 (0x831C0000); lwz r3, 8704(r11) -> 0x831C2200
-    ctx.r4.u64 = sp + 80u;
-    ctx.r3.u64 = REX_LOAD_U32(0x831C2200u);
-    ctx.lr     = 0x821BE9DC;
+    // 5. Push WorldMatrix & dispatch render pass via sub_828BD250 -> sub_821BA7D0 -> sub_828C4338
+    ctx.r3.u64 = REX_LOAD_U32(kAddrViewportCur);
+    ctx.r4.u64 = static_cast<uint64_t>(frame_r1 + 80u);
+    ctx.lr     = 0x821BE9DCu;
     sub_828BD250(ctx, base);
 
-
-    // lis r11, -32077 (0x82B30000); addi r3, r11, 28304 -> 0x82B36E90
-    const uint32_t r31_field8 = REX_LOAD_U32(r30_val + 8u);
-    ctx.r3.u64 = 0x82B36E90u;
-    ctx.lr     = 0x821BE9EC;
+    const uint32_t attach_f8 = REX_LOAD_U32(attach_obj + 8u);
+    ctx.r3.u64 = static_cast<uint64_t>(kAddrEffectCtx);
+    ctx.lr     = 0x821BE9ECu;
     sub_821BA7D0(ctx, base);
 
-
-    if (ctx.r3.u32 != 0u) {
-        const int32_t pass_type = static_cast<int32_t>(REX_LOAD_U32(ctx.r3.u32 + 8u));
-        ctx.r6.s64 = 0;
-        ctx.r5.u64 = r27_val;
-        ctx.r4.u64 = r31_field8;
-        ctx.r3.u64 = r29_next;
-
-
-        if (pass_type == 21) {
-            // lis r31, -31972 (0x831C0000); stb r11, 12114(r31) -> 0x831C2F52
-            REX_STORE_U8(0x831C2F52u, 0u);
-            ctx.lr = 0x821BEA20;
-            sub_828C4338(ctx, base);
-            REX_STORE_U8(0x831C2F52u, 1u);
-        } else {
-            ctx.lr = 0x821BEA34;
-            sub_828C4338(ctx, base);
-        }
+    const uint32_t eff_ctx = ctx.r3.u32;
+    if (eff_ctx == 0u) {
+        ctx.r1.u64 = saved_r1;
+        return;
     }
 
+    const int32_t eff_kind = static_cast<int32_t>(REX_LOAD_U32(eff_ctx + 8u));
+    ctx.r3.u64 = static_cast<uint64_t>(target_ea);
+    ctx.r4.u64 = static_cast<uint64_t>(attach_f8);
+    ctx.r5.u64 = arg_r7_u64;
+    ctx.r6.u64 = 0ULL;
 
-    ctx.r1.u32 = old_sp;
-    ctx.lr     = saved_lr;
+    if (eff_kind == 21) {
+        REX_STORE_U8(kAddrFlag831C2F62, 0u);
+        ctx.lr = 0x821BEA20u;
+        sub_828C4338(ctx, base);
+        REX_STORE_U8(kAddrFlag831C2F62, 1u);
+    } else {
+        ctx.lr = 0x821BEA34u;
+        sub_828C4338(ctx, base);
+    }
+
+    ctx.r1.u64 = saved_r1;
 }
 
 
@@ -1086,10 +1072,9 @@ extern "C" void sub_824F34F0(PPCContext& ctx, uint8_t* base) {
 
 
     const uint32_t r28 = REX_LOAD_U32(r29 + 12u);
-    sub_828C4078(ctx, base);
-
-
-    const bool has_c4078 = (ctx.r3.u32 != 0u);
+    const uint32_t c4078_val = REX_LOAD_U32(0x831C2F54u);
+    ctx.r3.u64 = c4078_val;
+    const bool has_c4078 = (c4078_val != 0u);
     const bool flag_r10  = has_c4078 && ((r28 & 0x3u) != 0u);
     const bool flag_r11  = flag_r10  && ((r28 & 0x2u) != 0u);
 

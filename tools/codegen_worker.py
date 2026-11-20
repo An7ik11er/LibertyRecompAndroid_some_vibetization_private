@@ -3,7 +3,7 @@
 tools/codegen_worker.py - Automated PPC function extractor, callgraph-aware inspector,
 LLM decompiler, and hook generator with self-repair.
 
-Supports both NVIDIA NIM API (cloud) and llama-server (local RTX 3070 Qwen2.5-Coder-7B).
+Supports both NVIDIA NIM API (cloud) and llama-server (local RTX 3070 M:\llm\Qwen3.5-9B.gguf).
 
 Usage examples:
   # 1. Zero-token function inspection on local RTX 3070 (for Flash / Pro before hooking):
@@ -65,7 +65,9 @@ CALLGRAPH_DB_PATH = os.path.join(WORKSPACE_ROOT, "Outsider_memory", "!!!!", "rag
 CORE_DOMAIN_FACTS = """
 ## Domain facts (do not contradict)
 - `PPCContext& ctx` holds VIRTUAL PowerPC guest registers: ctx.r0..r31, ctx.v0..v31, ctx.lr, ctx.ctr, ctx.xer, ctx.cr*. NOT host ARM64 registers.
-- REX_LOAD_*/REX_STORE_* apply BE<->LE byte-swap. Plain vld1q_u8/vst1q_u8 do not. Byte-wise ops (and/or) are endian-agnostic.
+- REX_LOAD_*/REX_STORE_* apply BE<->LE byte-swap and take a 32-bit GUEST `uint32_t ea` ONLY (NEVER pass `base + ...` — the macro adds `base` internally). Plain vld1q_u8/vst1q_u8 do not swap. Byte-wise ops (and/or) are endian-agnostic.
+- NEVER emit `REX_FUNC_EPILOGUE()` — that macro does NOT exist. Restore `ctx.r1.u32` (if modified) and `return;`.
+- NEVER compute `lis` math from `// lis rX, imm` comments without `<< 16`; ALWAYS use the exact C++ literal (e.g. `ctx.r11.s64 = -2102198272;` + `-2080` + `4036` -> `0x82B307A4u`).
 - lvx128/stvx128 in decompiled code emit shuffle_epi8 pairs that cancel. `ea = X & ~0xF` mirrors PPC semantics (low 4 bits ignored), NOT ARM alignment.
 - `__imp__sub_XXX(ctx, base)` is the RECOMPILED BODY of the same PPC function. Calling it from a hook is normal; no ABI transition happens.
 - `sub_XXX` without __imp__ may be a native ARM64 shim or another recompiled body — if unknown, say so.
@@ -376,7 +378,7 @@ def get_api_key() -> str:
     return DEFAULT_NIM_KEY
 
 
-def call_chat_completion(url: str, headers: dict, payload: dict, timeout: int = 180) -> str:
+def call_chat_completion(url: str, headers: dict, payload: dict, timeout: int = 600) -> str:
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as response:
@@ -384,7 +386,10 @@ def call_chat_completion(url: str, headers: dict, payload: dict, timeout: int = 
         choices = res_data.get("choices", [])
         if choices:
             msg = choices[0].get("message", {})
-            return msg.get("content") or ""
+            content = msg.get("content") or ""
+            if not content and msg.get("reasoning_content"):
+                print("[!] Warning: response truncated inside <think> before emitting final content.", file=sys.stderr)
+            return content
     return ""
 
 
@@ -478,6 +483,18 @@ def verify_cpp_code(code: str, expected_funcs: list, extracted_data: list = None
     if "REX_FUNC_PROLOGUE" not in code:
         return False, "Missing `REX_FUNC_PROLOGUE();` at the start of hooked function(s)."
 
+    if "REX_FUNC_EPILOGUE" in code:
+        return False, "Invalid macro `REX_FUNC_EPILOGUE()` does not exist! Restore `ctx.r1.u32` if modified and `return;`."
+
+    if re.search(r"REX_(?:LOAD|STORE)_[A-Z0-9]+\s*\(\s*base\s*[\+,]", code):
+        return False, "Invalid `REX_LOAD_*/REX_STORE_*(base + ...)`: pass ONLY 32-bit guest `uint32_t ea` (macro adds `base` internally)."
+
+    if re.search(r'#include\s+"(?:PowerPCContext|PPCContext|rex/)[^"]*"', code):
+        return False, "Do NOT emit invented local `#include \"...\"` headers (PPCContext and REX_* macros are already in scope)."
+
+    if re.search(r'\b(?:PPCCCRRegister|PPCCXERRegister)\b', code):
+        return False, "Typo in register type name (`PPCCCRRegister` / `PPCCXERRegister`): valid types are `PPCCRRegister` and `PPCXERRegister`."
+
     if extracted_data:
         for d in extracted_data:
             fn = d["func_name"]
@@ -510,7 +527,9 @@ def main():
     parser.add_argument("--spec", default="", help="Additional optimization requirements or domain rules")
     parser.add_argument("--extract-only", action="store_true", help="Only extract functions from generated recomp without calling LLM")
     parser.add_argument("--api-key", default="", help="Custom NVIDIA API key")
-    parser.add_argument("--max-tokens", type=int, default=8192, help="Max output tokens for completion")
+    parser.add_argument("--max-tokens", type=int, default=24576, help="Max output tokens for completion")
+    parser.add_argument("--thinking", default="on", choices=["on", "off"], help="Enable/disable Qwen3.5 thinking mode for local backend")
+    parser.add_argument("--presence-penalty", type=float, default=None, help="Override presence_penalty for local backend")
     parser.add_argument("--retries", type=int, default=2, help="Number of auto-repair retries if code validation fails")
 
     args = parser.parse_args()
@@ -608,14 +627,30 @@ def main():
         {"role": "user", "content": user_prompt},
     ]
 
-    payload = {
-        "model": args.model if not is_local else "qwen2.5-coder-7b",
-        "messages": messages,
-        "temperature": 0.1 if args.mode == "inspect" else 0.2,
-        "max_tokens": args.max_tokens,
-    }
+    thinking_on = (args.thinking == "on")
     if is_local:
-        payload["cache_prompt"] = True
+        default_pp = (0.0 if args.mode == "inspect" else 0.2) if thinking_on else 1.5
+        pp = args.presence_penalty if args.presence_penalty is not None else default_pp
+        payload = {
+            "model": "qwen3.5-9b",
+            "messages": messages,
+            "temperature": 0.6 if thinking_on else 0.7,
+            "top_p": 0.95 if thinking_on else 0.8,
+            "top_k": 20,
+            "min_p": 0.0,
+            "presence_penalty": pp,
+            "max_tokens": args.max_tokens,
+            "cache_prompt": True,
+        }
+        if not thinking_on:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+    else:
+        payload = {
+            "model": args.model,
+            "messages": messages,
+            "temperature": 0.1 if args.mode == "inspect" else 0.2,
+            "max_tokens": args.max_tokens,
+        }
 
     print(f"[*] Mode='{args.mode}' | Sending request to {target_url} (model='{payload['model']}')...")
 
@@ -658,6 +693,17 @@ def main():
         cleaned_code = clean_llm_response(raw_reply)
         if not cleaned_code:
             print(f"[-] Empty response on attempt {attempt + 1}", file=sys.stderr)
+            if attempt < args.retries:
+                if is_local:
+                    payload["presence_penalty"] = max(float(payload.get("presence_penalty", 0.0)), 0.3)
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your previous response produced no C++ code (likely truncated inside <think>). "
+                        "Keep reasoning brief and immediately output the COMPLETE ```cpp ... ``` block for: "
+                        + ", ".join(func_list)
+                    ),
+                })
             continue
 
         valid, msg = verify_cpp_code(cleaned_code, func_list, extracted_data)

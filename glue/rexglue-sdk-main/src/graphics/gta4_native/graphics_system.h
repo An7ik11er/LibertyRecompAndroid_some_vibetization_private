@@ -236,6 +236,14 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   bool SubmitTitleCommand(uint32_t title_id, uint32_t abi_version, const void* command,
                           size_t command_size) override;
   bool SubmitDirectDrawIndexed(const DrawIndexedPrimitiveCommand& command);
+  bool SubmitRageDirectDraw(
+      const ::gta4::vk_direct::RageDirectDrawPacket& pkt,
+      const NativeDirtyState* dirty_state = nullptr,
+      uint32_t device = 0,
+      uint32_t caller = 0,
+      uint32_t prim_restart_index = 0,
+      uint32_t batch_vb1 = 0,
+      uint32_t batch_stride1 = 0);
   bool ExecuteTitleCommand(uint32_t title_id, uint32_t abi_version, const void* command,
                            size_t command_size, void* result, size_t result_size) override;
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
@@ -3137,13 +3145,13 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     const NativeBufferResource* raw = nullptr;
   };
   static_assert(sizeof(BufferL1MruEntry) == 40);
-  // Batch 99: 2-way set-associative L1 (1024 sets x 2 ways = 2048 entries, 80 KB) for full-frame static buffer residency.
-  static constexpr size_t kBufferCaptureL1SetCount = 1024;
-  static constexpr size_t kBufferCaptureL1Ways = 2;
+  // Batch 107: 4-way set-associative L1 (4096 sets x 4 ways = 16384 entries, 640 KB) for full-frame static buffer residency.
+  static constexpr size_t kBufferCaptureL1SetCount = 4096;
+  static constexpr size_t kBufferCaptureL1Ways = 4;
   static constexpr size_t kBufferCaptureL1TableSize =
       kBufferCaptureL1SetCount * kBufferCaptureL1Ways;
   static constexpr uint32_t BufferL1SetBase(uint32_t handle) noexcept {
-    return ((handle * 0x9E3779B1u) >> (32 - 10)) * uint32_t(kBufferCaptureL1Ways);
+    return ((handle * 0x9E3779B1u) >> (32 - 12)) * uint32_t(kBufferCaptureL1Ways);
   }
   struct alignas(64) BufferMruEntry {
     uint32_t handle = 0;
@@ -3179,11 +3187,17 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
                                        uint32_t serial) noexcept {
     BufferL1MruEntry& e0 = buffer_capture_l1_table_[set_base];
     BufferL1MruEntry& e1 = buffer_capture_l1_table_[set_base + 1];
+    BufferL1MruEntry& e2 = buffer_capture_l1_table_[set_base + 2];
+    BufferL1MruEntry& e3 = buffer_capture_l1_table_[set_base + 3];
     if (e0.handle == handle) return e0;
     if (e1.handle == handle) return e1;
+    if (e2.handle == handle) return e2;
+    if (e3.handle == handle) return e3;
     if (e0.handle == 0 || e0.alias_serial != serial) return e0;
     if (e1.handle == 0 || e1.alias_serial != serial) return e1;
-    return buffer_capture_l1_table_[set_base + ((++buffer_l1_replace_rr_) & 1u)];
+    if (e2.handle == 0 || e2.alias_serial != serial) return e2;
+    if (e3.handle == 0 || e3.alias_serial != serial) return e3;
+    return buffer_capture_l1_table_[set_base + ((++buffer_l1_replace_rr_) & 3u)];
   }
 
   std::array<BufferCaptureCacheSlot, 8192> buffer_capture_cache_{};  // command_capture_mutex_
@@ -4299,6 +4313,12 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   uint32_t native_descriptor_capacity_ = 0;
   uint32_t native_sampler_descriptor_capacity_ = 0;
   bool null_images_initialized_ = false;
+
+  // Reusable template eliminates 184B stack zeroing & 64B LightingContext copy per draw.
+  DrawIndexedPrimitiveCommand direct_draw_template_{};
+  uint64_t direct_draw_id_counter_ = 0;
+  uint32_t cached_direct_device_ = 0;
+  bool direct_draw_template_ready_ = false;
 };
 
 }  // namespace rex::graphics::gta4_native
