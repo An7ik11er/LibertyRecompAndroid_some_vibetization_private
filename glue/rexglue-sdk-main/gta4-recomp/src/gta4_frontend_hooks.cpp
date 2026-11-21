@@ -215,6 +215,10 @@ enum class TextId : uint8_t {
   kSharp2,
   kSharp3,
   kSharp4,
+  // 71
+  kTouchSkinLabel,
+  kTouchSkinClassic,
+  kTouchSkinRockstar,
   kCount,
 };
 
@@ -337,6 +341,10 @@ constexpr std::array kTouchControlsChoices = {
     Choice{"off", TextId::kOff},
     Choice{"on", TextId::kOn},
     Choice{"auto", TextId::kAuto},
+};
+constexpr std::array kTouchSkinChoices = {
+    Choice{"classic", TextId::kTouchSkinClassic},
+    Choice{"rockstar", TextId::kTouchSkinRockstar},
 };
 constexpr std::array kFilmGrainChoices = {
     Choice{"true", TextId::kOff},
@@ -544,6 +552,8 @@ constexpr std::array kSettings = {
             kMouseAimChoices.data(), kMouseAimChoices.size()},
     Setting{"LR_TOUCH", TextId::kTouchControlsLabel, "touch_controls",
             kTouchControlsChoices.data(), kTouchControlsChoices.size()},
+    Setting{"LR_TOUCH_SKIN", TextId::kTouchSkinLabel, "gta4_touch_skin",
+            kTouchSkinChoices.data(), kTouchSkinChoices.size()},
     Setting{"LR_TOUCH_EDIT", TextId::kEditTouchLayoutLabel, "", nullptr, 0, false,
             SettingBinding::kTouchLayoutEditor},
     Setting{"LR_SONY", TextId::kSonyFeaturesLabel, "gta4_sony_enabled",
@@ -694,6 +704,10 @@ constexpr std::array<std::string_view, static_cast<size_t>(TextId::kCount)> kStr
     "2.0",
     "3.0",
     "4.0",
+    // 71
+    "Touch Style",
+    "Classic",
+    "Rockstar Mobile",
 };
 
 struct NativePageState {
@@ -1880,6 +1894,27 @@ bool SwitchPauseTab(PPCContext& parent, uint8_t* base, policy::PauseTabDirection
         "screen={}->{}",
         rex::input::NextInputTraceSequence(), static_cast<int32_t>(direction),
         g_last_frontend_channel, current, target);
+  }
+  return true;
+}
+
+bool SwitchPauseTabTo(PPCContext& parent, uint8_t* base, uint32_t target) {
+  const uint32_t current = REX_LOAD_U32(kCurrentScreenAddress);
+  if (!policy::IsPauseTabScreen(current) || !policy::IsPauseTabScreen(target)) {
+    return false;
+  }
+  if (current == target) {
+    return true;
+  }
+  if (policy::ShouldRestorePrimaryBeforeSwitch(g_display_menu.page, target, kDisplayScreen)) {
+    PublishPrimaryPage(base);
+  }
+  InvokeGuest(parent, base, __imp__sub_82256D08, g_last_frontend_channel, target, 0);
+  if (rex::input::IsInputTraceEnabled()) {
+    REXLOG_INFO(
+        "input-e2e: seq={} stage=pause-tab result=switched direction=direct channel={} "
+        "screen={}->{}",
+        rex::input::NextInputTraceSequence(), g_last_frontend_channel, current, target);
   }
   return true;
 }

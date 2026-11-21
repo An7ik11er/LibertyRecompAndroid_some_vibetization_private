@@ -63,7 +63,15 @@ struct GTA4FrontendTouchOverlayState {
   bool map_active = false;
   uint32_t pressed_mask = 0;
   std::vector<gta4::touch::FrontendRow> rows;
+  // 71: modern pause-menu touch (gta4_touch_frontend_modern).
+  bool modern = false;
+  uint32_t visible_edge_mask = gta4::touch::kAllFrontendEdgeBits;
+  gta4::touch::Rect tab_band{};
+  uint32_t tab_count = 0;
+  int32_t pressed_tab = -1;
 };
 
 int32_t GTA4_TouchConsumePendingPauseTabDirection() noexcept;
+// 71: index into kPauseTabScreens of a tapped pause-menu tab header, or -1.
+int32_t GTA4_TouchConsumePendingPauseTabTarget() noexcept;
 GTA4FrontendTouchOverlayState GTA4_ReadFrontendTouchOverlayState() noexcept;

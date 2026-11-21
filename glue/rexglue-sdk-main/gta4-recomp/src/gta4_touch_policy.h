@@ -218,10 +218,17 @@ inline constexpr std::array<FrontendEdgeZone, 10> kFrontendEdgeZones = {{
     {FrontendEdgeAction::kResume, {0.015f, 0.785f, 0.145f, 0.925f}, "RESUME", 1u << 9, false, false},
 }};
 
+// 71: edge zones the modern frontend layout still shows: BACK / RESUME everywhere and
+// ZOOM +/- on the map. Tabs, list scrolling and value adjustment moved onto the menu itself
+// (PauseTabStrip, FrontendKineticScroll, FrontendRowDrag). kAllFrontendEdgeBits is the
+// classic layout (gta4_touch_frontend_modern=false).
+inline constexpr uint32_t kAllFrontendEdgeBits = (1u << 10) - 1u;
+inline constexpr uint32_t kModernFrontendEdgeBits = (1u << 6) | (1u << 7) | (1u << 8) | (1u << 9);
+
 [[nodiscard]] inline const FrontendEdgeZone* HitTestFrontendEdgeZone(
-    Point point, bool map_active) noexcept {
+    Point point, bool map_active, uint32_t allowed_bits = kAllFrontendEdgeBits) noexcept {
   for (const FrontendEdgeZone& zone : kFrontendEdgeZones) {
-    if (zone.MatchesMode(map_active) && zone.bounds.contains(point)) {
+    if ((zone.bit & allowed_bits) && zone.MatchesMode(map_active) && zone.bounds.contains(point)) {
       return &zone;
     }
   }
@@ -237,9 +244,9 @@ class FrontendEdgeTransaction {
   }
 
   bool Begin(uint64_t pointer_id, uint64_t pointer_generation, bool map_active,
-             Point point) noexcept {
+             Point point, uint32_t allowed_bits = kAllFrontendEdgeBits) noexcept {
     if (active_) return false;
-    const FrontendEdgeZone* hit = HitTestFrontendEdgeZone(point, map_active);
+    const FrontendEdgeZone* hit = HitTestFrontendEdgeZone(point, map_active, allowed_bits);
     if (!hit) return false;
     active_ = true;
     inside_ = true;
@@ -346,6 +353,377 @@ class FrontendSwipeScroll {
   uint64_t pointer_id_ = 0;
   uint64_t pointer_generation_ = 0;
   float anchor_y_ = 0.0f;
+  bool active_ = false;
+};
+
+// ---------------------------------------------------------------------------------------
+// 71: modern pause-menu touch (Track 4A)
+// ---------------------------------------------------------------------------------------
+
+// Press pacing for synthesized D-pad steps: the retail menu acts on press edges, so every
+// step is one poll pressed followed by one poll released. Steps queue up while the finger
+// (or the fling) is faster than that.
+class FrontendStepPacer {
+ public:
+  static constexpr int32_t kMaxQueued = 24;
+
+  void Add(int32_t steps) noexcept {
+    pending_ = std::clamp(pending_ + steps, -kMaxQueued, kMaxQueued);
+  }
+  // -1, +1 or 0 for this poll.
+  int32_t Poll() noexcept {
+    if (gap_) {
+      gap_ = false;
+      return 0;
+    }
+    if (pending_ == 0) return 0;
+    const int32_t step = pending_ > 0 ? 1 : -1;
+    pending_ -= step;
+    gap_ = true;
+    return step;
+  }
+  [[nodiscard]] bool idle() const noexcept { return pending_ == 0 && !gap_; }
+  void Reset() noexcept {
+    pending_ = 0;
+    gap_ = false;
+  }
+
+ private:
+  int32_t pending_ = 0;
+  bool gap_ = false;
+};
+
+// Row pitch of the visible list, so one row of finger travel moves the selection one row
+// (the content follows the finger instead of jumping every 0.045).
+[[nodiscard]] inline float FrontendRowPitch(std::span<const FrontendRow> rows,
+                                            float fallback) noexcept {
+  std::array<float, 32> heights{};
+  size_t count = 0;
+  for (const FrontendRow& row : rows) {
+    if (!row.selectable || !row.bounds.valid()) continue;
+    const float h = row.bounds.bottom - row.bounds.top;
+    if (h > 0.005f && h < 0.25f && count < heights.size()) heights[count++] = h;
+  }
+  if (count == 0) return fallback;
+  std::nth_element(heights.begin(), heights.begin() + count / 2, heights.begin() + count);
+  return std::clamp(heights[count / 2], 0.02f, 0.09f);
+}
+
+// Finger-tracking list scroll with kinetic inertia. Finger motion is converted to whole
+// rows (FrontendRowPitch); on release the recent velocity keeps the list moving with
+// exponential friction. Dragging the finger upward scrolls the list down (+1).
+class FrontendKineticScroll {
+ public:
+  static constexpr float kDefaultStep = 0.045f;
+  static constexpr float kFlingMinVelocity = 0.45f;  // normalized screen heights / s
+  static constexpr float kFlingMaxVelocity = 6.0f;
+  static constexpr float kFriction = 5.0f;           // 1/s
+  static constexpr float kStopVelocity = 0.15f;
+  static constexpr uint64_t kVelocityWindowNs = 100'000'000;
+  static constexpr uint64_t kStaleReleaseNs = 70'000'000;
+
+  [[nodiscard]] bool active() const noexcept { return active_; }
+  [[nodiscard]] bool coasting() const noexcept { return coasting_; }
+  [[nodiscard]] uint64_t pointer_id() const noexcept { return pointer_id_; }
+
+  bool Begin(uint64_t pointer_id, uint64_t pointer_generation, Point point, uint64_t time_ns,
+             float step) noexcept {
+    if (active_ || !std::isfinite(point.y)) return false;
+    StopCoasting();
+    active_ = true;
+    pointer_id_ = pointer_id;
+    pointer_generation_ = pointer_generation;
+    step_ = std::isfinite(step) && step > 0.0f ? step : kDefaultStep;
+    travel_ = 0.0f;
+    last_y_ = point.y;
+    sample_count_ = 0;
+    Sample(time_ns, point.y);
+    return true;
+  }
+
+  bool Move(uint64_t pointer_id, uint64_t pointer_generation, Point point,
+            uint64_t time_ns) noexcept {
+    if (!active_ || pointer_id != pointer_id_) return false;
+    if (pointer_generation != pointer_generation_ || !std::isfinite(point.y)) {
+      Reset();
+      return false;
+    }
+    Travel(last_y_ - point.y);
+    last_y_ = point.y;
+    Sample(time_ns, point.y);
+    return true;
+  }
+
+  // Finger lifted at |time_ns|; |now_s| is the poll clock the inertia runs on.
+  bool End(uint64_t pointer_id, uint64_t pointer_generation, Point point, uint64_t time_ns,
+           double now_s) noexcept {
+    if (!active_ || pointer_id != pointer_id_) return false;
+    const bool valid = pointer_generation == pointer_generation_ && std::isfinite(point.y);
+    if (valid) {
+      Travel(last_y_ - point.y);
+      Sample(time_ns, point.y);
+    }
+    active_ = false;
+    const float velocity = valid ? ReleaseVelocity(time_ns) : 0.0f;  // finger, +down
+    if (std::fabs(velocity) >= kFlingMinVelocity) {
+      coasting_ = true;
+      velocity_ = std::clamp(-velocity, -kFlingMaxVelocity, kFlingMaxVelocity);
+      last_tick_s_ = now_s;
+    }
+    return true;
+  }
+
+  void Cancel(uint64_t pointer_id) noexcept {
+    if (active_ && pointer_id == pointer_id_) Reset();
+  }
+
+  // Once per input poll: advances the fling and returns the step for this poll.
+  int32_t Poll(double now_s) noexcept {
+    if (coasting_) {
+      const double dt = std::clamp(now_s - last_tick_s_, 0.0, 0.1);
+      last_tick_s_ = now_s;
+      Travel(float(velocity_ * dt));
+      velocity_ *= float(std::exp(-double(kFriction) * dt));
+      if (std::fabs(velocity_) < kStopVelocity) StopCoasting();
+    }
+    return pacer_.Poll();
+  }
+
+  // A tap or a new touch stops a running fling, like any native list.
+  void StopCoasting() noexcept {
+    coasting_ = false;
+    velocity_ = 0.0f;
+    pacer_.Reset();
+    travel_ = 0.0f;
+  }
+
+  void Reset() noexcept {
+    active_ = false;
+    pointer_id_ = 0;
+    pointer_generation_ = 0;
+    sample_count_ = 0;
+    StopCoasting();
+  }
+
+ private:
+  struct SampleEntry {
+    uint64_t time_ns = 0;
+    float y = 0.0f;
+  };
+
+  void Travel(float list_delta) noexcept {
+    if (!std::isfinite(list_delta)) return;
+    travel_ += list_delta;
+    int32_t steps = 0;
+    while (travel_ >= step_ && steps < FrontendStepPacer::kMaxQueued) {
+      travel_ -= step_;
+      ++steps;
+    }
+    while (travel_ <= -step_ && steps > -FrontendStepPacer::kMaxQueued) {
+      travel_ += step_;
+      --steps;
+    }
+    if (steps) pacer_.Add(steps);
+  }
+
+  void Sample(uint64_t time_ns, float y) noexcept {
+    samples_[sample_count_ % samples_.size()] = {time_ns, y};
+    ++sample_count_;
+  }
+
+  [[nodiscard]] float ReleaseVelocity(uint64_t release_ns) const noexcept {
+    if (sample_count_ < 2 || release_ns == 0) return 0.0f;
+    const size_t n = std::min<size_t>(sample_count_, samples_.size());
+    const SampleEntry& last = samples_[(sample_count_ - 1) % samples_.size()];
+    const SampleEntry* first = &last;
+    for (size_t i = 1; i < n; ++i) {
+      const SampleEntry& s = samples_[(sample_count_ - 1 - i) % samples_.size()];
+      if (s.time_ns > last.time_ns || last.time_ns - s.time_ns > kVelocityWindowNs) break;
+      first = &s;
+    }
+    if (first == &last || last.time_ns - first->time_ns < 8'000'000) return 0.0f;
+    // The finger rested before lifting: no fling.
+    const SampleEntry& before_last = samples_[(sample_count_ - 2) % samples_.size()];
+    if (last.time_ns >= before_last.time_ns &&
+        last.time_ns - before_last.time_ns > kStaleReleaseNs &&
+        std::fabs(last.y - before_last.y) < 0.002f) {
+      return 0.0f;
+    }
+    const double dt = double(last.time_ns - first->time_ns) * 1e-9;
+    return float(double(last.y - first->y) / dt);
+  }
+
+  std::array<SampleEntry, 8> samples_{};
+  size_t sample_count_ = 0;
+  FrontendStepPacer pacer_;
+  uint64_t pointer_id_ = 0;
+  uint64_t pointer_generation_ = 0;
+  double last_tick_s_ = 0.0;
+  float step_ = kDefaultStep;
+  float travel_ = 0.0f;
+  float last_y_ = 0.0f;
+  float velocity_ = 0.0f;  // list rows direction, normalized / s
+  bool active_ = false;
+  bool coasting_ = false;
+};
+
+// Tap-vs-drag disambiguation for a finger that went down on a menu row. Until the finger
+// leaves the slop it is a tap (select on down, accept on up, as before). Past the slop a
+// mostly vertical drag becomes a list scroll and a mostly horizontal drag adjusts the
+// selected row (sliders, toggles) by one step per kAdjustStep of finger travel; neither
+// accepts the row on release, so scrolling a long list no longer steals clicks.
+class FrontendRowDrag {
+ public:
+  enum class Mode : uint8_t { kNone, kPending, kScroll, kAdjust };
+  static constexpr float kSlopY = 0.022f;
+  static constexpr float kSlopX = 0.028f;
+  static constexpr float kAdjustStep = 0.032f;
+
+  [[nodiscard]] Mode mode() const noexcept { return mode_; }
+  [[nodiscard]] uint64_t pointer_id() const noexcept { return pointer_id_; }
+  [[nodiscard]] Point start() const noexcept { return start_; }
+  [[nodiscard]] uint64_t start_time_ns() const noexcept { return start_time_ns_; }
+
+  void Begin(uint64_t pointer_id, Point point, uint64_t time_ns) noexcept {
+    mode_ = Mode::kPending;
+    pointer_id_ = pointer_id;
+    start_ = point;
+    start_time_ns_ = time_ns;
+    anchor_x_ = point.x;
+    pacer_.Reset();
+  }
+
+  // Returns the mode after this move (kPending while still a tap).
+  Mode Move(uint64_t pointer_id, Point point) noexcept {
+    if (mode_ == Mode::kNone || pointer_id != pointer_id_ || !std::isfinite(point.x) ||
+        !std::isfinite(point.y)) {
+      return mode_;
+    }
+    if (mode_ == Mode::kPending) {
+      const float dx = point.x - start_.x;
+      const float dy = point.y - start_.y;
+      if (std::fabs(dy) > kSlopY && std::fabs(dy) >= std::fabs(dx)) {
+        mode_ = Mode::kScroll;
+      } else if (std::fabs(dx) > kSlopX && std::fabs(dx) > std::fabs(dy)) {
+        mode_ = Mode::kAdjust;
+        anchor_x_ = start_.x;
+      }
+    }
+    if (mode_ == Mode::kAdjust) {
+      int32_t steps = 0;
+      while (point.x - anchor_x_ >= kAdjustStep && steps < FrontendStepPacer::kMaxQueued) {
+        anchor_x_ += kAdjustStep;
+        ++steps;
+      }
+      while (point.x - anchor_x_ <= -kAdjustStep && steps > -FrontendStepPacer::kMaxQueued) {
+        anchor_x_ -= kAdjustStep;
+        --steps;
+      }
+      if (steps) pacer_.Add(steps);
+    }
+    return mode_;
+  }
+
+  // +1 right / -1 left / 0, paced like FrontendStepPacer. Keeps draining after release.
+  int32_t PollAdjust() noexcept { return pacer_.Poll(); }
+
+  void End(uint64_t pointer_id) noexcept {
+    if (pointer_id != pointer_id_) return;
+    mode_ = Mode::kNone;
+    pointer_id_ = 0;
+  }
+
+  void Reset() noexcept {
+    mode_ = Mode::kNone;
+    pointer_id_ = 0;
+    pacer_.Reset();
+  }
+
+ private:
+  FrontendStepPacer pacer_;
+  uint64_t pointer_id_ = 0;
+  uint64_t start_time_ns_ = 0;
+  Point start_{};
+  float anchor_x_ = 0.0f;
+  Mode mode_ = Mode::kNone;
+};
+
+// The pause menu's tab headers (kPauseTabScreens, left to right) as equal cells of one
+// header band in normalized output space. The band comes from gta4_touch_pause_tab_band;
+// gta4_touch_trace logs every tab hit so the band can be calibrated on a device.
+struct PauseTabStrip {
+  Rect band{};
+  uint32_t count = 0;
+
+  [[nodiscard]] bool valid() const noexcept { return count > 0 && band.valid(); }
+
+  [[nodiscard]] Rect TabBounds(uint32_t index) const noexcept {
+    if (!valid() || index >= count) return {};
+    const float w = (band.right - band.left) / float(count);
+    return {band.left + w * float(index), band.top, band.left + w * float(index + 1),
+            band.bottom};
+  }
+
+  [[nodiscard]] std::optional<uint32_t> HitTest(Point point) const noexcept {
+    if (!valid() || !band.contains(point)) return std::nullopt;
+    const float t = (point.x - band.left) / (band.right - band.left);
+    const uint32_t index = uint32_t(std::clamp(t, 0.0f, 1.0f) * float(count));
+    return std::min(index, count - 1);
+  }
+};
+
+// One tab tap: same tab under the finger on Down and Up, within the tap slop.
+class PauseTabTap {
+ public:
+  static constexpr float kSlop = 0.03f;
+  [[nodiscard]] bool active() const noexcept { return active_; }
+  [[nodiscard]] uint64_t pointer_id() const noexcept { return pointer_id_; }
+  [[nodiscard]] std::optional<uint32_t> pressed() const noexcept {
+    return active_ ? std::optional<uint32_t>(index_) : std::nullopt;
+  }
+
+  bool Begin(const PauseTabStrip& strip, uint64_t pointer_id, uint64_t pointer_generation,
+             Point point) noexcept {
+    if (active_) return false;
+    const auto hit = strip.HitTest(point);
+    if (!hit) return false;
+    active_ = true;
+    pointer_id_ = pointer_id;
+    pointer_generation_ = pointer_generation;
+    index_ = *hit;
+    start_ = point;
+    return true;
+  }
+
+  void Move(uint64_t pointer_id, Point point) noexcept {
+    if (!active_ || pointer_id != pointer_id_) return;
+    const float dx = point.x - start_.x;
+    const float dy = point.y - start_.y;
+    if (!(dx * dx + dy * dy <= kSlop * kSlop)) Reset();
+  }
+
+  std::optional<uint32_t> End(const PauseTabStrip& strip, uint64_t pointer_id,
+                              uint64_t pointer_generation, Point point) noexcept {
+    if (!active_ || pointer_id != pointer_id_) return std::nullopt;
+    const auto hit = strip.HitTest(point);
+    const bool valid = pointer_generation == pointer_generation_ && hit && *hit == index_;
+    const uint32_t index = index_;
+    Reset();
+    return valid ? std::optional<uint32_t>(index) : std::nullopt;
+  }
+
+  void Reset() noexcept {
+    active_ = false;
+    pointer_id_ = 0;
+    pointer_generation_ = 0;
+    index_ = 0;
+  }
+
+ private:
+  uint64_t pointer_id_ = 0;
+  uint64_t pointer_generation_ = 0;
+  Point start_{};
+  uint32_t index_ = 0;
   bool active_ = false;
 };
 

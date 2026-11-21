@@ -1598,14 +1598,18 @@ extern "C" void sub_821D9518(PPCContext& ctx, uint8_t* base) {
   int32_t x1 = static_cast<int32_t>(ctx.r6.u32) - origin_x;
   int32_t y1 = static_cast<int32_t>(ctx.r7.u32) - origin_y;
 
-  x0 = std::clamp(x0, 0, 47);
-  x1 = std::clamp(x1, 0, 47);
+  // PPC order (gta4_recomp.5.cpp loc_821D9548..loc_821D95C8): "if (v < lo) v = lo; else if
+  // (v > hi) v = hi". std::clamp is undefined for lo > hi (libstdc++ returns hi, libc++
+  // happens to match the PPC order, hardened libc++ traps); the row bounds at +9616/+9620 can
+  // be inverted, so spell the PPC order out. Harness: 200k vectors, 0 mismatches.
+  if (x0 < 0) x0 = 0; else if (x0 > 47) x0 = 47;
+  if (x1 < 0) x1 = 0; else if (x1 > 47) x1 = 47;
 
   const int32_t bound_y_min = static_cast<int32_t>(REX_LOAD_U32(grid_base + 9616u)) - origin_y;
   const int32_t bound_y_max = static_cast<int32_t>(REX_LOAD_U32(grid_base + 9620u)) - origin_y;
 
-  y0 = std::clamp(y0, bound_y_min, bound_y_max);
-  y1 = std::clamp(y1, bound_y_min, bound_y_max);
+  if (y0 < bound_y_min) y0 = bound_y_min; else if (y0 > bound_y_max) y0 = bound_y_max;
+  if (y1 < bound_y_min) y1 = bound_y_min; else if (y1 > bound_y_max) y1 = bound_y_max;
 
   if (y0 > y1) {
     ctx.r3.u64 = 0u;
@@ -1808,9 +1812,10 @@ extern "C" void sub_821BB6D8(PPCContext& ctx, uint8_t* base) {
     const float target_a0 = base_mul * alpha_0;
     const float current_a0 = std::bit_cast<float>(REX_LOAD_U32(kAlphaConstBufAddr + 0u));
     ctx.r4.s64 = static_cast<int64_t>(static_cast<int32_t>(kAlphaConstBufAddr));
+    // sub_8235CA58: fmuls f0 = base * f1 is live into sub_828C9090 on both paths.
+    ctx.f0.f64 = static_cast<double>(target_a0);
     if (current_a0 != target_a0) {
       REX_STORE_U32(kAlphaConstBufAddr + 0u, std::bit_cast<uint32_t>(target_a0));
-      ctx.f0.f64 = static_cast<double>(target_a0);
       ctx.r6.s64 = 5;
       ctx.r5.s64 = 1;
       ctx.r3.u64 = REX_LOAD_U32(kShaderMgrPtrAddr);
@@ -1818,7 +1823,12 @@ extern "C" void sub_821BB6D8(PPCContext& ctx, uint8_t* base) {
     }
 
     ctx.f1.f64 = static_cast<double>(alpha_1);
+    // sub_8235CAC8 is a separate guest function: it starts with FZ off (disableFlushMode in its
+    // recompiled body), while sub_828C9090 above may have left the host in flush-to-zero, which
+    // turns a denormal alpha_1 compare into a different branch than the guest takes.
+    ctx.fpscr.disableFlushMode();
     const float current_a1 = std::bit_cast<float>(REX_LOAD_U32(kAlphaConstBufAddr + 8u));
+    ctx.f0.f64 = static_cast<double>(current_a1);  // lfs f0,8(r4)
     ctx.r4.s64 = static_cast<int64_t>(static_cast<int32_t>(kAlphaConstBufAddr));
     if (current_a1 != alpha_1) {
       REX_STORE_U32(kAlphaConstBufAddr + 8u, std::bit_cast<uint32_t>(alpha_1));
@@ -1846,7 +1856,9 @@ extern "C" void sub_821BB6D8(PPCContext& ctx, uint8_t* base) {
     }
   }
 
-  // 4. Matrix 3x4
+  // 4. Matrix 3x4 (sub_82860058 runs with FZ off; sub_828C60C0/sub_828C19C0 may have set it,
+  // which flushes denormal matrix terms the guest keeps)
+  ctx.fpscr.disableFlushMode();
   {
     const uint32_t mtx_ea = sp + 96u;
     const float k_sqrt2 = std::bit_cast<float>(REX_LOAD_U32(0x82086140u));
@@ -1936,7 +1948,12 @@ extern "C" void sub_821BB6D8(PPCContext& ctx, uint8_t* base) {
       ctx.r8.s64 = 0;
       ctx.r9.s64 = 0;
       ctx.r3.u64 = r29_drawable + 16u;
-      FastSub828D4268(ctx, base);
+      ctx.r11.u64 = sp + 96u;  // sub_828CC178: mr r11,r4
+      // Through the sub_828D4268 wrapper: in temporal mode and with native trace it routes to
+      // SlowSub828D4268 (temporal_host::Scope, offscreen transform trace); otherwise it is the
+      // same FastSub828D4268 call. Calling FastSub828D4268 directly skipped both for every
+      // drawable reached from here (introduced in b5a0204).
+      sub_828D4268(ctx, base);
     } else {
       ctx.r3.u64 = r29_drawable;
       ctx.r4.u64 = sp + 96u;

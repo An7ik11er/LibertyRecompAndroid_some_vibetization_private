@@ -7,8 +7,11 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <string>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -31,6 +34,12 @@
 
 REXCVAR_DEFINE_BOOL(gta4_touch_trace, false, "GTA IV/Input/Touch",
                     "Trace joined touch pointer, layout, and retail action transactions");
+REXCVAR_DEFINE_BOOL(gta4_touch_frontend_modern, true, "GTA IV/Input/Touch",
+                    "Pause menu touch: tap the tab headers, drag/fling lists with inertia, "
+                    "drag a row sideways to adjust it. false = classic edge buttons");
+REXCVAR_DEFINE_STRING(gta4_touch_pause_tab_band, "0.10,0.06,0.90,0.16", "GTA IV/Input/Touch",
+                      "Pause menu tab header band, normalized left,top,right,bottom; split "
+                      "into equal cells for the 7 pause tabs (gta4_touch_trace logs hits)");
 
 namespace {
 
@@ -147,6 +156,12 @@ VirtualKeySnapshot g_virtual_keys;
 gta4::touch::FrontendTransaction g_frontend_transaction;
 gta4::touch::FrontendEdgeTransaction g_frontend_edge_transaction;
 gta4::touch::FrontendSwipeScroll g_frontend_swipe_scroll;
+// 71: modern pause-menu touch (gta4_touch_frontend_modern).
+gta4::touch::FrontendKineticScroll g_frontend_kinetic;
+gta4::touch::FrontendRowDrag g_frontend_row_drag;
+gta4::touch::PauseTabTap g_pause_tab_tap;
+std::atomic<int32_t> g_pending_pause_tab_target{-1};
+constexpr uint32_t kPauseTabCount = 7;  // gta4::frontend_menu::policy::kPauseTabScreens
 GTA4FrontendTouchOverlayState g_frontend_overlay_state;
 std::atomic<int32_t> g_pending_pause_tab_direction{0};
 gta4::touch::TapTransaction g_minimap_transaction;
@@ -347,6 +362,69 @@ gta4::input::MapPanAction AccumulateMapOutput(const MapGestureOutput& output,
   return action;
 }
 
+bool ModernFrontendTouch() noexcept { return REXCVAR_GET(gta4_touch_frontend_modern); }
+
+uint32_t FrontendEdgeBits() noexcept {
+  return ModernFrontendTouch() ? gta4::touch::kModernFrontendEdgeBits
+                               : gta4::touch::kAllFrontendEdgeBits;
+}
+
+double TouchClockSeconds() noexcept {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+gta4::touch::PauseTabStrip CurrentPauseTabStrip() {
+  static std::string cached_text;
+  static gta4::touch::PauseTabStrip cached{};
+  const std::string text = REXCVAR_GET(gta4_touch_pause_tab_band);
+  if (text != cached_text || !cached.count) {
+    cached_text = text;
+    float v[4] = {0.10f, 0.06f, 0.90f, 0.16f};
+    const char* cursor = text.c_str();
+    for (int i = 0; i < 4 && cursor && *cursor; ++i) {
+      char* end = nullptr;
+      const float value = std::strtof(cursor, &end);
+      if (end == cursor) break;
+      if (std::isfinite(value)) v[i] = std::clamp(value, 0.0f, 1.0f);
+      cursor = (*end == ',') ? end + 1 : end;
+    }
+    cached = {.band = {v[0], v[1], v[2], v[3]}, .count = kPauseTabCount};
+    if (!cached.band.valid()) cached.band = {0.10f, 0.06f, 0.90f, 0.16f};
+  }
+  return cached;
+}
+
+// Tab header tap on the pause menu (map included). Returns true when the event belongs to a
+// tab tap, which then owns the pointer until it lifts.
+bool ProcessPauseTabEvent(const AbsolutePointerEvent& event, Point point, uint64_t epoch,
+                          bool may_begin) {
+  if (!ModernFrontendTouch()) return false;
+  const gta4::touch::PauseTabStrip strip = CurrentPauseTabStrip();
+  if (event.phase == AbsolutePointerPhase::kDown) {
+    return may_begin && !g_pause_tab_tap.active() &&
+           g_pause_tab_tap.Begin(strip, event.pointer_id, event.generation, point);
+  }
+  if (!g_pause_tab_tap.active() || g_pause_tab_tap.pointer_id() != event.pointer_id) {
+    return false;
+  }
+  if (event.phase == AbsolutePointerPhase::kMove) {
+    g_pause_tab_tap.Move(event.pointer_id, point);
+  } else if (event.phase == AbsolutePointerPhase::kUp) {
+    if (const auto tab = g_pause_tab_tap.End(strip, event.pointer_id, event.generation, point)) {
+      g_pending_pause_tab_target.store(int32_t(*tab), std::memory_order_release);
+      if (REXCVAR_GET(gta4_touch_trace)) {
+        REXLOG_INFO(
+            "gta4-touch: epoch={} event={} pointer={} owner=pause-tab tab={} point={:.4f},{:.4f}",
+            epoch, event.sequence, event.pointer_id, *tab, point.x, point.y);
+      }
+    }
+  } else {
+    g_pause_tab_tap.Reset();
+  }
+  return true;
+}
+
 void ApplyFrontendEdgeAction(gta4::touch::FrontendEdgeAction action) noexcept {
   using E = gta4::touch::FrontendEdgeAction;
   switch (action) {
@@ -387,8 +465,13 @@ void ApplyFrontendEdgeAction(gta4::touch::FrontendEdgeAction action) noexcept {
 
 void ProcessMapEvent(const AbsolutePointerEvent& event, uint64_t epoch) {
   const Point norm_point = NormalizedPoint(event);
+  if (ProcessPauseTabEvent(event, norm_point, epoch,
+                           !g_map_gesture.active() && !g_frontend_edge_transaction.active())) {
+    return;
+  }
   if (event.phase == AbsolutePointerPhase::kDown && !g_map_gesture.active() &&
-      g_frontend_edge_transaction.Begin(event.pointer_id, event.generation, true, norm_point)) {
+      g_frontend_edge_transaction.Begin(event.pointer_id, event.generation, true, norm_point,
+                                        FrontendEdgeBits())) {
     return;
   }
   if (g_frontend_edge_transaction.active() &&
@@ -438,9 +521,15 @@ void ProcessFrontendEvent(PPCContext& context, uint8_t* base,
                           const AbsolutePointerEvent& event, uint64_t epoch,
                           const FrontendGeometry& geometry) {
   const Point point = NormalizedPoint(event);
+  const bool modern = ModernFrontendTouch();
+  if (modern && event.phase == AbsolutePointerPhase::kDown) {
+    // Any new touch stops a running fling, like a native list.
+    g_frontend_kinetic.StopCoasting();
+  }
   if (event.phase == AbsolutePointerPhase::kDown && !g_frontend_transaction.active() &&
-      !g_frontend_swipe_scroll.active() &&
-      g_frontend_edge_transaction.Begin(event.pointer_id, event.generation, false, point)) {
+      !g_frontend_swipe_scroll.active() && !g_frontend_kinetic.active() &&
+      g_frontend_edge_transaction.Begin(event.pointer_id, event.generation, false, point,
+                                        FrontendEdgeBits())) {
     return;
   }
   if (g_frontend_edge_transaction.active() &&
@@ -457,7 +546,75 @@ void ProcessFrontendEvent(PPCContext& context, uint8_t* base,
   }
   const std::optional<FrontendRow> hit =
       gta4::touch::HitTestFrontendRow(geometry.rows, point);
-  if (event.phase == AbsolutePointerPhase::kDown && !hit &&
+  if (modern) {
+    // Tab headers: only where no menu row is under the finger.
+    if (ProcessPauseTabEvent(event, point, epoch,
+                             !hit && !g_frontend_transaction.active() &&
+                                 !g_frontend_kinetic.active())) {
+      return;
+    }
+    const float pitch = gta4::touch::FrontendRowPitch(
+        geometry.rows, gta4::touch::FrontendKineticScroll::kDefaultStep);
+    if (g_frontend_kinetic.active() && g_frontend_kinetic.pointer_id() == event.pointer_id) {
+      if (event.phase == AbsolutePointerPhase::kMove) {
+        g_frontend_kinetic.Move(event.pointer_id, event.generation, point, event.timestamp_ns);
+      } else if (event.phase == AbsolutePointerPhase::kUp) {
+        g_frontend_kinetic.End(event.pointer_id, event.generation, point, event.timestamp_ns,
+                               TouchClockSeconds());
+        g_frontend_row_drag.End(event.pointer_id);
+      } else {
+        g_frontend_kinetic.Cancel(event.pointer_id);
+        g_frontend_row_drag.Reset();
+      }
+      return;
+    }
+    if (event.phase == AbsolutePointerPhase::kDown && !hit &&
+        !g_frontend_transaction.active()) {
+      g_frontend_kinetic.Begin(event.pointer_id, event.generation, point, event.timestamp_ns,
+                               pitch);
+      return;
+    }
+    if (g_frontend_row_drag.mode() != gta4::touch::FrontendRowDrag::Mode::kNone &&
+        g_frontend_row_drag.pointer_id() == event.pointer_id) {
+      using Mode = gta4::touch::FrontendRowDrag::Mode;
+      if (event.phase == AbsolutePointerPhase::kMove) {
+        const Mode before = g_frontend_row_drag.mode();
+        const Mode after = g_frontend_row_drag.Move(event.pointer_id, point);
+        if (before == Mode::kPending && after == Mode::kScroll) {
+          // Became a list drag: the row press is no tap any more (no accept on release);
+          // the scroll starts where the finger went down, so no travel is lost.
+          g_frontend_transaction.Cancel(event.pointer_id, event.generation);
+          g_frontend_kinetic.Begin(event.pointer_id, event.generation, g_frontend_row_drag.start(),
+                                   g_frontend_row_drag.start_time_ns(), pitch);
+          g_frontend_kinetic.Move(event.pointer_id, event.generation, point, event.timestamp_ns);
+          return;
+        }
+        if (after == Mode::kAdjust) {
+          if (before == Mode::kPending) {
+            g_frontend_transaction.Cancel(event.pointer_id, event.generation);
+          }
+          return;
+        }
+        // Still a tap: keep the press on its row (no selection hopping under a resting
+        // finger); the transaction only tracks whether it is still armed.
+        if (after == Mode::kPending) {
+          const auto move = g_frontend_transaction.Move(event.pointer_id, event.generation,
+                                                        geometry.generation, hit);
+          (void)move;
+          return;
+        }
+      } else if (event.phase != AbsolutePointerPhase::kDown) {
+        const Mode mode = g_frontend_row_drag.mode();
+        g_frontend_row_drag.End(event.pointer_id);
+        if (mode == Mode::kAdjust) {
+          if (event.phase == AbsolutePointerPhase::kCancel) g_frontend_row_drag.Reset();
+          return;
+        }
+        // kPending: fall through to the tap's normal Up / Cancel below.
+      }
+    }
+  }
+  if (!modern && event.phase == AbsolutePointerPhase::kDown && !hit &&
       !g_frontend_transaction.active()) {
     g_frontend_swipe_scroll.Begin(event.pointer_id, event.generation, point);
     return;
@@ -481,6 +638,7 @@ void ProcessFrontendEvent(PPCContext& context, uint8_t* base,
       if (hit && g_frontend_transaction.Begin(event.pointer_id, event.generation,
                                                geometry.generation, *hit)) {
         SelectFrontendRow(context, base, hit->channel, hit->row, epoch, event);
+        if (modern) g_frontend_row_drag.Begin(event.pointer_id, point, event.timestamp_ns);
       }
       break;
     case AbsolutePointerPhase::kMove: {
@@ -593,6 +751,9 @@ void ResetTransactions() noexcept {
   g_frontend_transaction.Reset();
   g_frontend_edge_transaction.Reset();
   g_frontend_swipe_scroll.Reset();
+  g_frontend_kinetic.Reset();
+  g_frontend_row_drag.Reset();
+  g_pause_tab_tap.Reset();
   g_minimap_transaction.Reset();
   g_weapon_transaction.Reset();
   g_map_gesture.Reset();
@@ -600,10 +761,19 @@ void ResetTransactions() noexcept {
 
 void PublishFrontendOverlayState(bool active, bool map_active, uint32_t pressed_mask,
                                  const std::vector<FrontendRow>* rows) {
+  const bool modern = active && ModernFrontendTouch();
+  const gta4::touch::PauseTabStrip strip =
+      modern ? CurrentPauseTabStrip() : gta4::touch::PauseTabStrip{};
+  const auto pressed_tab = g_pause_tab_tap.pressed();
   std::lock_guard lock(g_geometry_mutex);
   g_frontend_overlay_state.active = active;
   g_frontend_overlay_state.map_active = map_active;
   g_frontend_overlay_state.pressed_mask = pressed_mask;
+  g_frontend_overlay_state.visible_edge_mask = FrontendEdgeBits();
+  g_frontend_overlay_state.modern = modern;
+  g_frontend_overlay_state.tab_band = strip.band;
+  g_frontend_overlay_state.tab_count = strip.count;
+  g_frontend_overlay_state.pressed_tab = pressed_tab ? int32_t(*pressed_tab) : -1;
   if (active && !map_active && rows) {
     g_frontend_overlay_state.rows = *rows;
   } else {
@@ -728,9 +898,13 @@ void GTA4_TouchConsumePoll(PPCContext& context, uint8_t* base, uint64_t epoch) {
   if (!frontend_navigation_active) {
     g_frontend_transaction.Reset();
     g_frontend_swipe_scroll.Reset();
+    g_frontend_kinetic.Reset();
+    g_frontend_row_drag.Reset();
   }
   if (!frontend_active || editor_captures) {
     g_frontend_edge_transaction.Reset();
+    g_pause_tab_tap.Reset();
+    g_pending_pause_tab_target.store(-1, std::memory_order_release);
   }
   if (!map_active || editor_captures) {
     g_map_gesture.Reset();
@@ -770,6 +944,15 @@ void GTA4_TouchConsumePoll(PPCContext& context, uint8_t* base, uint64_t epoch) {
     }
   }
 
+  if (frontend_navigation_active && ModernFrontendTouch()) {
+    // One paced step per poll from the finger-tracking / coasting list and the row drag.
+    if (const int32_t step = g_frontend_kinetic.Poll(TouchClockSeconds())) {
+      if (step < 0) g_replay.up = true; else g_replay.down = true;
+    }
+    if (const int32_t adjust = g_frontend_row_drag.PollAdjust()) {
+      if (adjust < 0) g_replay.left = true; else g_replay.right = true;
+    }
+  }
   ApplyMapZoom(base, epoch);
   PublishFrontendOverlayState(
       frontend_active && !editor_captures, map_active && !editor_captures,
@@ -1037,6 +1220,10 @@ extern "C" void sub_8239C468(PPCContext& context, uint8_t* base) {
 
 int32_t GTA4_TouchConsumePendingPauseTabDirection() noexcept {
   return g_pending_pause_tab_direction.exchange(0, std::memory_order_acq_rel);
+}
+
+int32_t GTA4_TouchConsumePendingPauseTabTarget() noexcept {
+  return g_pending_pause_tab_target.exchange(-1, std::memory_order_acq_rel);
 }
 
 GTA4FrontendTouchOverlayState GTA4_ReadFrontendTouchOverlayState() noexcept {

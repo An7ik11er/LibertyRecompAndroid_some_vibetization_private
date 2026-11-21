@@ -89,10 +89,14 @@ static inline float32x4_t RexVnmsubF32_8296C540(float32x4_t a, float32x4_t b, fl
   return vld1q_f32(fr);
 }
 
-// Exact match for simde_mm_dp_ps(a, b, 0xEF): (((0.0f + a.z*b.z) + a.y*b.y) + a.x*b.x) broadcast to all 4 lanes
+// Exact match for simde_mm_dp_ps(a, b, 0xEF) as SIMDe builds it on AArch64
+// (SIMDE_ARM_NEON_A64V8_NATIVE: vmulq_f32, mask PPC element w, vaddvq_f32). In the SIMDe register
+// layout the lanes are {w, z, y, x}, and vaddvq_f32 is FADDP + FADDP = (l0 + l1) + (l2 + l3), so the
+// sum is (0 + z) + (y + x). The old ((0 + z) + y) + x is SIMDe's portable fallback order, which this
+// build never uses: it rounds differently in ~1.5% of curved-edge candidates (1 ulp in *r3).
 static inline float32x4_t Dot3Broadcast_8296C540(float32x4_t a, float32x4_t b) {
   const float32x4_t p = vmulq_f32(a, b);
-  const float sum = (((0.0f + vgetq_lane_f32(p, 2)) + vgetq_lane_f32(p, 1)) + vgetq_lane_f32(p, 0));
+  const float sum = (0.0f + vgetq_lane_f32(p, 2)) + (vgetq_lane_f32(p, 1) + vgetq_lane_f32(p, 0));
   return vdupq_n_f32(sum);
 }
 
@@ -226,8 +230,8 @@ extern "C" void sub_8296C540(PPCContext& ctx, uint8_t* base) {
         const float32x4_t py0 = RexVmaddF32_8296C540(fy0, v_sy, v_oy);
         const float32x4_t pz0 = RexVmaddF32_8296C540(fz0, v_sz, v_oz);
 
-        // Exact simde_mm_dp_ps(..., 0xEF) order: (((0.0f + dz*pz) + dy*py) + dx*px)
-        const float32x4_t dot0 = vaddq_f32(vaddq_f32(vaddq_f32(v_zero, vmulq_f32(v_dz, pz0)), vmulq_f32(v_dy, py0)), vmulq_f32(v_dx, px0));
+        // Exact SIMDe-on-AArch64 simde_mm_dp_ps(..., 0xEF) order: (0 + dz*pz) + (dy*py + dx*px)
+        const float32x4_t dot0 = vaddq_f32(vaddq_f32(v_zero, vmulq_f32(v_dz, pz0)), vaddq_f32(vmulq_f32(v_dy, py0), vmulq_f32(v_dx, px0)));
 
         // Vertices i+4..i+7
         const float32x4_t fx1 = vcvtq_f32_s32(vmovl_high_s16(ix));
@@ -238,7 +242,7 @@ extern "C" void sub_8296C540(PPCContext& ctx, uint8_t* base) {
         const float32x4_t py1 = RexVmaddF32_8296C540(fy1, v_sy, v_oy);
         const float32x4_t pz1 = RexVmaddF32_8296C540(fz1, v_sz, v_oz);
 
-        const float32x4_t dot1 = vaddq_f32(vaddq_f32(vaddq_f32(v_zero, vmulq_f32(v_dz, pz1)), vmulq_f32(v_dy, py1)), vmulq_f32(v_dx, px1));
+        const float32x4_t dot1 = vaddq_f32(vaddq_f32(v_zero, vmulq_f32(v_dz, pz1)), vaddq_f32(vmulq_f32(v_dy, py1), vmulq_f32(v_dx, px1)));
 
         const uint32x4_t gt0 = vcgtq_f32(dot0, v_best);
         const uint32x4_t gt1 = vcgtq_f32(dot1, v_best);

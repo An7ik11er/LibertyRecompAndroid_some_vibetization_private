@@ -24,6 +24,7 @@ using rex::ppc::VectorMaskL;
 // Forward declarations for methods dispatched in DispatchDrawableMethod
 extern "C" void sub_828CC298(PPCContext& ctx, uint8_t* base);
 extern "C" void FastSub828D4268(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_828D4268(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_828CC1A0(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_828CC178(PPCContext& ctx, uint8_t* base);
 
@@ -32,7 +33,10 @@ inline void DispatchDrawableMethod(uint32_t target_fn, PPCContext& ctx, uint8_t*
     if (target_fn == 0x828CC298u) [[likely]] {
         sub_828CC298(ctx, base);
     } else if (target_fn == 0x828D4268u) [[likely]] {
-        FastSub828D4268(ctx, base);
+        // The wrapper, not FastSub828D4268: it is the same fast call unless temporal mode or the
+        // native trace is on, where SlowSub828D4268 opens the temporal_host::Scope and records
+        // the offscreen transform transition. The direct call skipped both.
+        sub_828D4268(ctx, base);
     } else if (target_fn == 0x828CC1A0u) [[likely]] {
         sub_828CC1A0(ctx, base);
     } else if (target_fn == 0x828CC178u) [[likely]] {
@@ -1223,6 +1227,8 @@ extern "C" void sub_822188F8(PPCContext& ctx, uint8_t* base) {
 
     // 99.57% всех вызовов в RenderGuest идут напрямую в sub_824F34F0
     if (target_fn == 0x824F34F0u) [[likely]] {
+        // Same register state the generated bctr leaves for the callee (r11 = ctr = target).
+        ctx.r11.u64 = target_fn;
         sub_824F34F0(ctx, base);
     } else [[unlikely]] {
         ctx.r11.u64 = target_fn;

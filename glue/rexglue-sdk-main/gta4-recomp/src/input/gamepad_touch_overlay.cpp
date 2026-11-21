@@ -16,7 +16,7 @@
 #include <rex/input/absolute_pointer.h>
 #include <rex/input/input.h>
 
-REXCVAR_DEFINE_STRING(gta4_touch_layout, "gamepad", "GTA IV/Input/Touch",
+REXCVAR_DEFINE_STRING(gta4_touch_layout, "context", "GTA IV/Input/Touch",
                       "On-screen touch controls: gamepad (a fixed Xbox 360 controller) or context "
                       "(the context-sensitive layout)")
     .allowed({"gamepad", "context"});

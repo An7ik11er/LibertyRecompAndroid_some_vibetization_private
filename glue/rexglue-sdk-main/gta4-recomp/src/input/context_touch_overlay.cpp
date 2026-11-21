@@ -4,6 +4,7 @@
 #include <cctype>
 #include <fstream>
 #include <vector>
+#include <rex/cvar.h>
 #include <rex/input/absolute_pointer.h>
 #include <rex/input/input.h>
 #include <rex/ui/image_decode.h>
@@ -12,7 +13,20 @@
 #include "input/context_touch_settings.h"
 #include "input/gamepad_touch_overlay.h"
 
+REXCVAR_DEFINE_STRING(gta4_touch_skin, "rockstar", "GTA IV/Input/Touch",
+                      "Context touch controls look: classic or rockstar (GTA SA/VC mobile style "
+                      "procedural vector glyphs; same layout and saved placements)");
+
 namespace gta4::input {
+
+namespace {
+ContextTouchSkin CurrentContextTouchSkin() {
+  const std::string skin = REXCVAR_GET(gta4_touch_skin);
+  return (skin == "rockstar" || skin == "rockstar_mobile" || skin == "mobile")
+             ? ContextTouchSkin::kRockstarMobile
+             : ContextTouchSkin::kClassic;
+}
+}  // namespace
 
 ContextTouchOverlay::ContextTouchOverlay(rex::ui::ImGuiDrawer* drawer,
                                          rex::ui::ImmediateDrawer* immediate,
@@ -76,7 +90,7 @@ void ContextTouchOverlay::OnDraw(ImGuiIO& io) {
   DrawContextTouchOverlay(ImGui::GetForegroundDrawList(), ImGui::GetFont(), ImGui::GetFontSize(),
                           snapshot, io.DisplaySize.x, io.DisplaySize.y,
                           icon_resolver_ ? icon_resolver_ : ResolveIcon,
-                          icon_resolver_ ? icon_context_ : this);
+                          icon_resolver_ ? icon_context_ : this, CurrentContextTouchSkin());
   if (!ContextTouchEditorCapturesInput() && rex::input::TouchPointerInputActive() &&
       !GTA4_TouchTitleInputOwned()) {
     const auto frontend_overlay = GTA4_ReadFrontendTouchOverlayState();
@@ -87,7 +101,12 @@ void ContextTouchOverlay::OnDraw(ImGuiIO& io) {
           {.active = frontend_overlay.active,
            .map_active = frontend_overlay.map_active,
            .pressed_mask = frontend_overlay.pressed_mask,
-           .rows = frontend_overlay.rows},
+           .rows = frontend_overlay.rows,
+           .modern = frontend_overlay.modern,
+           .visible_edge_mask = frontend_overlay.visible_edge_mask,
+           .tab_band = frontend_overlay.tab_band,
+           .tab_count = frontend_overlay.tab_count,
+           .pressed_tab = frontend_overlay.pressed_tab},
           io.DisplaySize.x, io.DisplaySize.y);
     }
   }

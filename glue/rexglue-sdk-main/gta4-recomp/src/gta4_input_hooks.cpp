@@ -2121,6 +2121,16 @@ extern "C" void sub_828CCD60(PPCContext& ctx, uint8_t* base) {
               : gta4::frontend_menu::policy::PauseTabDirection::kNext);
     }
   }
+  // 71: a tapped tab header switches straight to that tab (same retail switch call).
+  if (const int32_t touch_tab = GTA4_TouchConsumePendingPauseTabTarget(); touch_tab >= 0) {
+    const uint32_t screen =
+        gta4::input::LoadU32(base, gta4::input::kCurrentScreenAddress);
+    const auto& tabs = gta4::frontend_menu::policy::kPauseTabScreens;
+    if (epoch.frontend_active && gta4::frontend_menu::policy::IsPauseTabScreen(screen) &&
+        size_t(touch_tab) < tabs.size()) {
+      gta4::frontend_menu::SwitchPauseTabTo(ctx, base, tabs[size_t(touch_tab)]);
+    }
+  }
   gta4::GTA4MotionBridge::Get().SetReloadContextActive(
       !epoch.frontend_active && !epoch.phone_visible && !GTA4_TouchTitleInputOwned() &&
       gta4::input::LoadU32(base, 0x82BA1D40) == 0 &&

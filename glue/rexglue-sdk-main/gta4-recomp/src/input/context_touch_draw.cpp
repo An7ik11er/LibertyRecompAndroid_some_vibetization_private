@@ -10,7 +10,8 @@ namespace {
 void DrawContextTouchLayer(ImDrawList* draw, ImFont* font, float font_size,
                              const ContextTouchLayout& layout, const ContextTouchOverlaySnapshot* input, float fade_alpha,
                              float logical_width, float logical_height,
-                             ContextTouchIconResolver resolver, void* icon_context) {
+                             ContextTouchIconResolver resolver, void* icon_context,
+                             ContextTouchSkin skin) {
   if (!draw || !font || !std::isfinite(font_size) || font_size <= 0.0f ||
       layout.mode == ContextTouchMode::kFrontend ||
       layout.mode == ContextTouchMode::kMap) return;
@@ -84,7 +85,31 @@ void DrawContextTouchLayer(ImDrawList* draw, ImFont* font, float font_size,
       }
       continue;
     }
-    const float max_halo = std::max(
+    if (skin == ContextTouchSkin::kRockstarMobile) {
+      // Rockstar mobile: dark glass disc, thin white rim, white glyph; pressed = amber.
+      draw->AddCircleFilled(center, radius,
+                            active ? color(236, 150, 40, 150.0f) : color(0, 0, 0, 105.0f), 48);
+      draw->AddCircle(center, radius,
+                      active ? color(255, 214, 120, 255.0f) : color(255, 255, 255, 150.0f), 48,
+                      std::max(1.2f, radius * (active ? 0.06f : 0.035f)));
+      const bool stick = control.kind == ContextTouchControlKind::kMovementStick ||
+                         control.kind == ContextTouchControlKind::kRightStick;
+      if (stick) {
+        const bool right = control.kind == ContextTouchControlKind::kRightStick;
+        const float x = std::clamp(right ? (input ? input->right_x : 0.0f) : (input ? input->movement_x : 0.0f), -255.0f, 255.0f) / 255.0f;
+        const float y = std::clamp(right ? (input ? input->right_y : 0.0f) : (input ? input->movement_y : 0.0f), -255.0f, 255.0f) / 255.0f;
+        draw->AddCircle(center, radius * 0.62f, color(255, 255, 255, 60.0f), 40, 1.2f);
+        const ImVec2 thumb(center.x + x * radius * 0.55f, center.y + y * radius * 0.55f);
+        draw->AddCircleFilled(thumb, radius * 0.30f, color(255, 255, 255, active ? 235.0f : 190.0f), 32);
+        draw->AddCircle(thumb, radius * 0.30f, color(0, 0, 0, 90.0f), 32, 1.0f);
+        continue;
+      }
+      const ImU32 ink = active ? color(255, 255, 255, 255.0f) : color(255, 255, 255, 235.0f);
+      const ImU32 accent = color(255, 190, 70, 245.0f);
+      if (DrawRockstarTouchGlyph(draw, control.action, center, radius, ink, accent)) continue;
+      // No glyph for this action: icon or label below, on the mobile disc.
+    }
+    const float max_halo = skin == ContextTouchSkin::kRockstarMobile ? 0.0f : std::max(
         0.0f, std::min({center.x, center.y, logical_width - center.x, logical_height - center.y}) -
                   radius);
     const float halo_delta = std::min(std::max(1.5f, radius * 0.08f), max_halo);
@@ -93,11 +118,13 @@ void DrawContextTouchLayer(ImDrawList* draw, ImFont* font, float font_size,
                       active ? color(255, 190, 75, 150.0f) : color(120, 205, 255, 70.0f), 48,
                       std::max(1.5f, radius * 0.045f));
     }
+    if (skin != ContextTouchSkin::kRockstarMobile) {
     draw->AddCircleFilled(center, radius, active ? color(236, 135, 42, 255.0f)
                                                : color(12, 18, 27, 210.0f), 48);
     draw->AddCircle(center, radius,
                     active ? color(255, 230, 140, 255.0f) : color(185, 230, 255, 235.0f), 48,
                     std::max(1.3f, radius * (active ? 0.045f : 0.032f)));
+    }
     if (control.kind == ContextTouchControlKind::kMovementStick || control.kind == ContextTouchControlKind::kRightStick) {
       const bool right = control.kind == ContextTouchControlKind::kRightStick;
       const float x = std::clamp(right ? (input ? input->right_x : 0.0f) : (input ? input->movement_x : 0.0f), -255.0f, 255.0f) / 255.0f;
@@ -135,13 +162,229 @@ void DrawContextTouchLayer(ImDrawList* draw, ImFont* font, float font_size,
 void DrawContextTouchOverlay(ImDrawList* draw, ImFont* font, float font_size,
                              const ContextTouchOverlaySnapshot& snapshot,
                              float logical_width, float logical_height,
-                             ContextTouchIconResolver resolver, void* icon_context) {
+                             ContextTouchIconResolver resolver, void* icon_context,
+                             ContextTouchSkin skin) {
   if (!snapshot.visible) return;
   if (snapshot.outgoing_layout && snapshot.outgoing_alpha > 0.0f)
     DrawContextTouchLayer(draw, font, font_size, *snapshot.outgoing_layout, nullptr,
-        snapshot.fade_alpha * snapshot.outgoing_alpha, logical_width, logical_height, resolver, icon_context);
+        snapshot.fade_alpha * snapshot.outgoing_alpha, logical_width, logical_height, resolver, icon_context, skin);
   DrawContextTouchLayer(draw, font, font_size, snapshot.layout, &snapshot,
-      snapshot.fade_alpha * snapshot.layout_alpha, logical_width, logical_height, resolver, icon_context);
+      snapshot.fade_alpha * snapshot.layout_alpha, logical_width, logical_height, resolver, icon_context, skin);
+}
+
+// 71: procedural Rockstar-mobile glyphs. Everything is in units of the button radius r
+// around c, stroked with |ink|; |accent| marks the "action" part (muzzle flash, arrow tip).
+bool DrawRockstarTouchGlyph(ImDrawList* draw, TouchAction action, ImVec2 c, float r,
+                            ImU32 ink, ImU32 accent) {
+  if (!draw || !std::isfinite(r) || r <= 1.0f) return false;
+  const float w = std::max(1.5f, r * 0.085f);  // stroke
+  const auto P = [c, r](float x, float y) { return ImVec2(c.x + x * r, c.y + y * r); };
+  const auto line = [&](float x0, float y0, float x1, float y1, ImU32 col) {
+    draw->AddLine(P(x0, y0), P(x1, y1), col, w);
+  };
+  const auto chevron = [&](float x, float y, float s, bool up, ImU32 col) {
+    const float d = up ? -s : s;
+    draw->AddPolyline(std::array<ImVec2, 3>{P(x - s, y - d * 0.5f), P(x, y + d * 0.5f),
+                                            P(x + s, y - d * 0.5f)}.data(),
+                      3, col, 0, w);
+  };
+  const auto chevron_h = [&](float x, float y, float s, bool right, ImU32 col) {
+    const float d = right ? s : -s;
+    draw->AddPolyline(std::array<ImVec2, 3>{P(x - d * 0.5f, y - s), P(x + d * 0.5f, y),
+                                            P(x - d * 0.5f, y + s)}.data(),
+                      3, col, 0, w);
+  };
+  const auto triangle = [&](float x, float y, float s, float dir_x, float dir_y, ImU32 col) {
+    // filled triangle pointing along (dir_x, dir_y)
+    const float px = -dir_y, py = dir_x;
+    draw->AddTriangleFilled(P(x + dir_x * s, y + dir_y * s),
+                            P(x - dir_x * s * 0.6f + px * s * 0.8f, y - dir_y * s * 0.6f + py * s * 0.8f),
+                            P(x - dir_x * s * 0.6f - px * s * 0.8f, y - dir_y * s * 0.6f - py * s * 0.8f),
+                            col);
+  };
+  const auto arc = [&](float x, float y, float rr, float a0, float a1, ImU32 col) {
+    draw->PathClear();
+    draw->PathArcTo(P(x, y), rr * r, a0, a1, 24);
+    draw->PathStroke(col, 0, w);
+  };
+  constexpr float kPi = 3.14159265f;
+  using A = TouchAction;
+  switch (action) {
+    case A::kFire:
+    case A::kVehicleFire: {  // bullet with a muzzle burst
+      draw->AddRectFilled(P(-0.34f, -0.09f), P(0.12f, 0.09f), ink, r * 0.03f);
+      draw->AddTriangleFilled(P(0.12f, -0.09f), P(0.30f, 0.0f), P(0.12f, 0.09f), ink);
+      for (int i = -1; i <= 1; ++i) line(0.36f, i * 0.12f, 0.52f, i * 0.22f, accent);
+      return true;
+    }
+    case A::kVehicleAltFire: {  // rocket
+      draw->AddRectFilled(P(-0.30f, -0.08f), P(0.16f, 0.08f), ink, r * 0.03f);
+      draw->AddTriangleFilled(P(0.16f, -0.08f), P(0.36f, 0.0f), P(0.16f, 0.08f), ink);
+      draw->AddTriangleFilled(P(-0.30f, -0.08f), P(-0.42f, -0.22f), P(-0.20f, -0.08f), ink);
+      draw->AddTriangleFilled(P(-0.30f, 0.08f), P(-0.42f, 0.22f), P(-0.20f, 0.08f), ink);
+      line(-0.48f, 0.0f, -0.62f, 0.0f, accent);
+      return true;
+    }
+    case A::kAim:
+    case A::kFreeAim: {  // crosshair
+      draw->AddCircle(c, r * 0.36f, ink, 32, w);
+      line(0.0f, -0.56f, 0.0f, -0.20f, ink); line(0.0f, 0.20f, 0.0f, 0.56f, ink);
+      line(-0.56f, 0.0f, -0.20f, 0.0f, ink); line(0.20f, 0.0f, 0.56f, 0.0f, ink);
+      draw->AddCircleFilled(c, r * 0.06f, action == A::kAim ? accent : ink, 12);
+      return true;
+    }
+    case A::kRunSprint: {  // double chevron forward
+      chevron_h(-0.14f, 0.0f, 0.26f, true, ink);
+      chevron_h(0.14f, 0.0f, 0.26f, true, accent);
+      return true;
+    }
+    case A::kJumpClimb: {  // arrow up over a ledge
+      line(0.0f, 0.22f, 0.0f, -0.30f, ink);
+      chevron(0.0f, -0.24f, 0.22f, true, ink);
+      line(-0.40f, 0.38f, 0.40f, 0.38f, accent);
+      return true;
+    }
+    case A::kCrouch: {  // arrow down onto the floor
+      line(0.0f, -0.36f, 0.0f, 0.14f, ink);
+      chevron(0.0f, 0.10f, 0.22f, false, ink);
+      line(-0.40f, 0.36f, 0.40f, 0.36f, accent);
+      return true;
+    }
+    case A::kCover: {  // wall with a figure tucked behind it
+      draw->AddRect(P(0.06f, -0.42f), P(0.30f, 0.42f), ink, 0.0f, 0, w);
+      draw->AddCircleFilled(P(-0.18f, -0.22f), r * 0.10f, ink, 16);
+      line(-0.18f, -0.10f, -0.18f, 0.20f, ink);
+      line(-0.18f, 0.20f, -0.30f, 0.40f, ink); line(-0.18f, 0.20f, -0.04f, 0.40f, ink);
+      return true;
+    }
+    case A::kReload: {  // circular arrow
+      arc(0.0f, 0.0f, 0.34f, -kPi * 0.35f, kPi * 1.35f, ink);
+      triangle(0.34f * std::cos(-kPi * 0.35f), 0.34f * std::sin(-kPi * 0.35f), 0.14f,
+               std::cos(-kPi * 0.35f - kPi * 0.5f) * -1.0f, std::sin(-kPi * 0.35f - kPi * 0.5f) * -1.0f,
+               accent);
+      return true;
+    }
+    case A::kContext: {  // door with an arrow into it (enter / exit / interact)
+      draw->AddRect(P(0.02f, -0.40f), P(0.36f, 0.40f), ink, 0.0f, 0, w);
+      draw->AddCircleFilled(P(0.26f, 0.02f), r * 0.04f, ink, 10);
+      line(-0.44f, 0.0f, -0.08f, 0.0f, accent);
+      chevron_h(-0.12f, 0.0f, 0.14f, true, accent);
+      return true;
+    }
+    case A::kWeaponNext:
+    case A::kWeaponPrevious: {
+      const bool next = action == A::kWeaponNext;
+      draw->AddRect(P(-0.26f, -0.16f), P(0.26f, 0.16f), ink, r * 0.05f, 0, w);
+      chevron_h(next ? 0.44f : -0.44f, 0.0f, 0.14f, next, accent);
+      return true;
+    }
+    case A::kWeaponWheel:
+    case A::kWeaponSelect: {  // segmented wheel
+      for (int i = 0; i < 6; ++i) {
+        const float a0 = kPi * 2.0f * float(i) / 6.0f + 0.12f;
+        arc(0.0f, 0.0f, 0.38f, a0, a0 + kPi * 2.0f / 6.0f - 0.24f, i == 0 ? accent : ink);
+      }
+      draw->AddCircleFilled(c, r * 0.08f, ink, 12);
+      return true;
+    }
+    case A::kPhone: {  // handset
+      draw->AddRect(P(-0.18f, -0.40f), P(0.18f, 0.40f), ink, r * 0.07f, 0, w);
+      line(-0.08f, -0.30f, 0.08f, -0.30f, ink);
+      draw->AddRectFilled(P(-0.11f, -0.20f), P(0.11f, 0.20f), accent, r * 0.02f);
+      return true;
+    }
+    case A::kAccelerate: {  // pedal arrow up
+      triangle(0.0f, -0.10f, 0.34f, 0.0f, -1.0f, ink);
+      line(-0.30f, 0.34f, 0.30f, 0.34f, accent);
+      return true;
+    }
+    case A::kBrake: {  // pedal arrow down
+      triangle(0.0f, 0.10f, 0.34f, 0.0f, 1.0f, ink);
+      line(-0.30f, -0.34f, 0.30f, -0.34f, accent);
+      return true;
+    }
+    case A::kHandbrake: {  // (P) with brackets
+      draw->AddCircle(c, r * 0.32f, ink, 32, w);
+      arc(0.0f, 0.0f, 0.50f, kPi * 0.70f, kPi * 1.30f, accent);
+      arc(0.0f, 0.0f, 0.50f, -kPi * 0.30f, kPi * 0.30f, accent);
+      line(-0.08f, 0.18f, -0.08f, -0.18f, ink);
+      arc(-0.02f, -0.08f, 0.10f, -kPi * 0.5f, kPi * 0.5f, ink);
+      return true;
+    }
+    case A::kHorn: {  // speaker with waves
+      draw->AddRectFilled(P(-0.40f, -0.10f), P(-0.24f, 0.10f), ink);
+      draw->AddTriangleFilled(P(-0.24f, -0.10f), P(-0.04f, -0.28f), P(-0.04f, 0.28f), ink);
+      draw->AddTriangleFilled(P(-0.24f, -0.10f), P(-0.04f, 0.28f), P(-0.24f, 0.10f), ink);
+      arc(-0.04f, 0.0f, 0.22f, -kPi * 0.25f, kPi * 0.25f, accent);
+      arc(-0.04f, 0.0f, 0.38f, -kPi * 0.25f, kPi * 0.25f, accent);
+      return true;
+    }
+    case A::kRadioNext:
+    case A::kRadioPrevious: {  // radio dial + skip arrow
+      draw->AddCircle(P(0.0f, 0.06f), r * 0.24f, ink, 24, w);
+      line(-0.16f, -0.24f, 0.18f, -0.42f, ink);
+      const bool next = action == A::kRadioNext;
+      triangle(next ? 0.44f : -0.44f, 0.06f, 0.14f, next ? 1.0f : -1.0f, 0.0f, accent);
+      return true;
+    }
+    case A::kCameraCycle: {  // camera body
+      draw->AddRect(P(-0.36f, -0.20f), P(0.36f, 0.24f), ink, r * 0.05f, 0, w);
+      draw->AddRectFilled(P(-0.14f, -0.30f), P(0.10f, -0.20f), ink);
+      draw->AddCircle(P(0.0f, 0.02f), r * 0.12f, accent, 20, w);
+      return true;
+    }
+    case A::kLookBehind: {  // U-turn arrow
+      arc(0.0f, 0.04f, 0.24f, kPi, kPi * 2.0f, ink);
+      line(-0.24f, 0.04f, -0.24f, 0.36f, ink);
+      line(0.24f, 0.04f, 0.24f, 0.30f, ink);
+      triangle(0.24f, 0.36f, 0.14f, 0.0f, 1.0f, accent);
+      return true;
+    }
+    case A::kHeliAscend:
+    case A::kHeliDescend: {
+      const bool up = action == A::kHeliAscend;
+      chevron(0.0f, up ? -0.12f : 0.12f, 0.26f, up, accent);
+      chevron(0.0f, up ? 0.12f : -0.12f, 0.26f, up, ink);
+      return true;
+    }
+    case A::kHeliYawLeft:
+    case A::kHeliYawRight: {
+      const bool right = action == A::kHeliYawRight;
+      arc(0.0f, 0.10f, 0.32f, kPi * 1.15f, kPi * 1.85f, ink);
+      const float a = right ? kPi * 1.85f : kPi * 1.15f;
+      triangle(0.32f * std::cos(a), 0.10f + 0.32f * std::sin(a), 0.13f, right ? 1.0f : -1.0f,
+               0.35f, accent);
+      return true;
+    }
+    case A::kDeploy: {  // parachute canopy
+      arc(0.0f, 0.0f, 0.40f, kPi, kPi * 2.0f, ink);
+      line(-0.40f, 0.0f, 0.40f, 0.0f, ink);
+      line(-0.36f, 0.0f, 0.0f, 0.38f, ink); line(0.36f, 0.0f, 0.0f, 0.38f, ink);
+      draw->AddCircleFilled(P(0.0f, 0.40f), r * 0.07f, accent, 12);
+      return true;
+    }
+    case A::kParachuteBrakeLeft:
+    case A::kParachuteBrakeRight: {
+      const bool right = action == A::kParachuteBrakeRight;
+      arc(0.0f, 0.10f, 0.34f, kPi, kPi * 2.0f, ink);
+      line(right ? 0.34f : -0.34f, 0.10f, right ? 0.34f : -0.34f, 0.42f, accent);
+      return true;
+    }
+    case A::kDetach: {  // broken link
+      draw->AddRect(P(-0.44f, -0.12f), P(-0.06f, 0.12f), ink, r * 0.10f, 0, w);
+      draw->AddRect(P(0.06f, -0.12f), P(0.44f, 0.12f), ink, r * 0.10f, 0, w);
+      line(-0.04f, -0.30f, 0.04f, -0.18f, accent); line(-0.04f, 0.30f, 0.04f, 0.18f, accent);
+      return true;
+    }
+    case A::kHeadlights: {  // headlight beam
+      arc(-0.10f, 0.0f, 0.24f, kPi * 0.5f, kPi * 1.5f, ink);
+      line(-0.10f, -0.24f, -0.10f, 0.24f, ink);
+      for (int i = -1; i <= 1; ++i) line(0.04f, i * 0.16f, 0.40f, i * 0.16f + 0.06f, accent);
+      return true;
+    }
+    default:
+      return false;
+  }
 }
 
 void DrawContextTouchFrontendOverlay(ImDrawList* draw, ImFont* font, float font_size,
@@ -174,9 +417,31 @@ void DrawContextTouchFrontendOverlay(ImDrawList* draw, ImFont* font, float font_
     }
   }
 
-  // Edge action hitboxes (< TAB, TAB >, UP, < -, + >, DN, ZOOM +/-, BACK, RESUME).
+  // 71: tab header strip. Barely-there underline per tab cell, lit while pressed, so the
+  // retail headers stay the visual and the touch target is still discoverable.
+  if (view.modern && view.tab_count && view.tab_band.valid()) {
+    const gta4::touch::PauseTabStrip strip{view.tab_band, view.tab_count};
+    for (uint32_t i = 0; i < view.tab_count; ++i) {
+      const gta4::touch::Rect cell = strip.TabBounds(i);
+      const float x0 = cell.left * logical_width + 3.0f;
+      const float x1 = cell.right * logical_width - 3.0f;
+      const float y1 = cell.bottom * logical_height;
+      if (x1 - x0 < 6.0f) continue;
+      const bool pressed = view.pressed_tab == int32_t(i);
+      if (pressed) {
+        draw->AddRectFilled(ImVec2(x0, cell.top * logical_height), ImVec2(x1, y1),
+                            IM_COL32(236, 135, 42, 70), 6.0f);
+      }
+      draw->AddLine(ImVec2(x0, y1), ImVec2(x1, y1),
+                    pressed ? IM_COL32(255, 205, 110, 230) : IM_COL32(150, 220, 255, 70),
+                    pressed ? 3.0f : 1.5f);
+    }
+  }
+
+  // Edge action hitboxes (< TAB, TAB >, UP, < -, + >, DN, ZOOM +/-, BACK, RESUME); the
+  // modern layout keeps only BACK / RESUME and the map's ZOOM.
   for (const auto& zone : gta4::touch::kFrontendEdgeZones) {
-    if (!zone.MatchesMode(view.map_active)) continue;
+    if (!zone.MatchesMode(view.map_active) || !(zone.bit & view.visible_edge_mask)) continue;
     const ImVec2 lo(zone.bounds.left * logical_width, zone.bounds.top * logical_height);
     const ImVec2 hi(zone.bounds.right * logical_width, zone.bounds.bottom * logical_height);
     const float w = hi.x - lo.x;
@@ -209,9 +474,13 @@ void DrawContextTouchFrontendOverlay(ImDrawList* draw, ImFont* font, float font_
   }
 
   // Compact bottom gesture hint strip.
-  const char* hint = view.map_active
-      ? "Map: 1-finger drag = Pan  |  Tap = Waypoint  |  Pinch / ZOOM = Scale  |  Edges = Tabs / Back"
-      : "Menu: Tap row = Select  |  Swipe empty = Scroll  |  Edges = Tabs / Scroll / Adjust / Back";
+  const char* hint = view.modern
+      ? (view.map_active
+             ? "Map: Drag = Pan  |  Tap = Waypoint  |  Pinch / ZOOM = Scale  |  Tap a tab = Switch"
+             : "Menu: Tap = Select  |  Drag / flick = Scroll  |  Drag row sideways = Adjust  |  Tap a tab = Switch")
+      : (view.map_active
+             ? "Map: 1-finger drag = Pan  |  Tap = Waypoint  |  Pinch / ZOOM = Scale  |  Edges = Tabs / Back"
+             : "Menu: Tap row = Select  |  Swipe empty = Scroll  |  Edges = Tabs / Scroll / Adjust / Back");
   const float hint_font = std::clamp(logical_height * 0.022f, 11.0f, font_size * 0.85f);
   const ImVec2 hint_nat = font->CalcTextSizeA(hint_font, FLT_MAX, 0.0f, hint);
   const float max_hint_w = logical_width * 0.66f;
