@@ -20,6 +20,10 @@ inline uint32_t FastGuestAtomicExchangeU32(uint8_t* base, uint32_t ea, uint32_t 
   uint32_t* const host_ptr = reinterpret_cast<uint32_t*>(REX_RAW_ADDR(ea));
   const uint32_t new_be = __builtin_bswap32(new_val);
   if (!__atomic_load_n(&gta4_atomic_sections_lock_flag, __ATOMIC_RELAXED)) [[likely]] {
+    if (__atomic_load_n(host_ptr, __ATOMIC_RELAXED) == new_be) [[likely]] {
+      ctx.reserved.u32 = new_be;
+      return new_val;
+    }
     const uint32_t old_be = __atomic_exchange_n(host_ptr, new_be, __ATOMIC_ACQ_REL);
     ctx.reserved.u32 = old_be;
     return __builtin_bswap32(old_be);
@@ -609,6 +613,13 @@ extern "C" void FastSub828C6620(PPCContext& ctx, uint8_t* base) {
         FastGeometryDraw(base, REX_LOAD_U16(geom + 54u), vdecl,
                          REX_LOAD_U32(geom + r10_vb_off), REX_LOAD_U32(geom + r11_ib_off),
                          REX_LOAD_U32(geom + 44u), caller, stream1_buf);
+      } else if (draw_fn == 0x828BFC00u) {
+        ctx.r3.u64 = geom;
+        ctx.r4.u64 = r24_geom_idx;
+        ctx.r10.u64 = (r24_geom_idx << 2) & 0xFFFFFFFCu;
+        ctx.r11.u64 = draw_fn;
+        ctx.lr = 0x828C669Cu;
+        sub_828BFC00(ctx, base);
       } else {
         ctx.r3.u64 = geom;
         ctx.r4.u64 = r24_geom_idx;
@@ -842,10 +853,12 @@ extern "C" void FastSub828D41A8(PPCContext& ctx, uint8_t* base) {
       bool visible = true;
       if (r25_mask_ptr != 0u) {
         const uint32_t mask_words = REX_LOAD_U32(r25_mask_ptr);
-        const uint32_t word_off =
-            (static_cast<uint32_t>(static_cast<int32_t>(r31_lod) >> 5) << 2) & 0xFFFFFFFCu;
-        const uint32_t mask_word = REX_LOAD_U32(mask_words + word_off);
-        visible = ((mask_word >> (r31_lod & 0x1Fu)) & 1u) != 0u;
+        if (mask_words != 0u) {
+          const uint32_t word_off =
+              (static_cast<uint32_t>(static_cast<int32_t>(r31_lod) >> 5) << 2) & 0xFFFFFFFCu;
+          const uint32_t mask_word = REX_LOAD_U32(mask_words + word_off);
+          visible = ((mask_word >> (r31_lod & 0x1Fu)) & 1u) != 0u;
+        }
       }
       if (visible) {
         const uint32_t models_array = REX_LOAD_U32(r30_model_list);
@@ -1307,6 +1320,10 @@ extern "C" void sub_821DA748(PPCContext& ctx, uint8_t* base) {
             r28_node = REX_LOAD_U32(r28_node + 4u);
             if (r28_node != 0u) {
               __builtin_prefetch(REX_RAW_ADDR(r28_node), 0, 3);
+              const uint32_t next_ent = REX_LOAD_U32(r28_node);
+              if (next_ent != 0u) {
+                __builtin_prefetch(REX_RAW_ADDR(next_ent + 36u), 0, 1);
+              }
             }
 
             const uint32_t flags36 = REX_LOAD_U32(r31_entity + 36u);
@@ -1457,6 +1474,10 @@ extern "C" void sub_821DA9C8(PPCContext& ctx, uint8_t* base) {
         r26_node = REX_LOAD_U32(r26_node + 4u);
         if (r26_node != 0u) {
           __builtin_prefetch(REX_RAW_ADDR(r26_node), 0, 3);
+          const uint32_t next_ent = REX_LOAD_U32(r26_node);
+          if (next_ent != 0u) {
+            __builtin_prefetch(REX_RAW_ADDR(next_ent + 36u), 0, 1);
+          }
         }
 
         const uint32_t r30_flags36 = REX_LOAD_U32(r31_entity + 36u);
@@ -1592,12 +1613,7 @@ extern "C" void sub_821D9518(PPCContext& ctx, uint8_t* base) {
   }
 
   const int32_t count_y = (y1 - y0) + 1;
-  const int32_t count_x = (x1 - x0) + 1;
-
-  if (count_x <= 0) [[unlikely]] {
-    ctx.r3.u64 = 0u;
-    return;
-  }
+  const int32_t count_x = std::max<int32_t>(1, (x1 - x0) + 1);
 
   const uint32_t start_offset = static_cast<uint32_t>(((y0 * 48) + x0 + 2) * 4);
   uint32_t row_ea = grid_base + start_offset;
@@ -1672,7 +1688,7 @@ extern "C" void sub_821D9770(PPCContext& ctx, uint8_t* base) {
   do {
     const uint32_t next_row = cur_row + 480u;
     const uint32_t* row_ptr = reinterpret_cast<const uint32_t*>(REX_RAW_ADDR(cur_row));
-    int32_t c = col_count + 1;
+    int32_t c = std::max<int32_t>(1, col_count + 1);
 #if defined(__aarch64__)
     uint32x4_t v_acc = vdupq_n_u32(0);
     while (c >= 4) {
@@ -1920,7 +1936,7 @@ extern "C" void sub_821BB6D8(PPCContext& ctx, uint8_t* base) {
       ctx.r8.s64 = 0;
       ctx.r9.s64 = 0;
       ctx.r3.u64 = r29_drawable + 16u;
-      sub_828D4268(ctx, base);
+      FastSub828D4268(ctx, base);
     } else {
       ctx.r3.u64 = r29_drawable;
       ctx.r4.u64 = sp + 96u;
