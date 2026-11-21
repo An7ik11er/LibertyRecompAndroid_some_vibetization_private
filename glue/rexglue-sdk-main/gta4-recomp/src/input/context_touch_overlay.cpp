@@ -5,8 +5,10 @@
 #include <fstream>
 #include <vector>
 #include <rex/input/absolute_pointer.h>
+#include <rex/input/input.h>
 #include <rex/ui/image_decode.h>
 
+#include "gta4_touch_coordinator.h"
 #include "input/context_touch_settings.h"
 #include "input/gamepad_touch_overlay.h"
 
@@ -75,6 +77,20 @@ void ContextTouchOverlay::OnDraw(ImGuiIO& io) {
                           snapshot, io.DisplaySize.x, io.DisplaySize.y,
                           icon_resolver_ ? icon_resolver_ : ResolveIcon,
                           icon_resolver_ ? icon_context_ : this);
+  if (!ContextTouchEditorCapturesInput() && rex::input::TouchPointerInputActive() &&
+      !GTA4_TouchTitleInputOwned()) {
+    const auto frontend_overlay = GTA4_ReadFrontendTouchOverlayState();
+    if (frontend_overlay.active) {
+      repaint_needed_ = true;
+      DrawContextTouchFrontendOverlay(
+          ImGui::GetForegroundDrawList(), ImGui::GetFont(), ImGui::GetFontSize(),
+          {.active = frontend_overlay.active,
+           .map_active = frontend_overlay.map_active,
+           .pressed_mask = frontend_overlay.pressed_mask,
+           .rows = frontend_overlay.rows},
+          io.DisplaySize.x, io.DisplaySize.y);
+    }
+  }
 }
 
 }  // namespace gta4::input

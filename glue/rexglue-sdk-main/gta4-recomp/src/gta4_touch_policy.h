@@ -176,6 +176,179 @@ class FrontendTransaction {
   bool armed_ = false;
 };
 
+enum class FrontendEdgeAction : uint8_t {
+  kNone = 0,
+  kPrevTab,
+  kNextTab,
+  kScrollUp,
+  kScrollDown,
+  kAdjustLeft,
+  kAdjustRight,
+  kZoomIn,
+  kZoomOut,
+  kBack,
+  kResume,
+};
+
+struct FrontendEdgeZone {
+  FrontendEdgeAction action = FrontendEdgeAction::kNone;
+  Rect bounds{};
+  const char* label = "";
+  uint32_t bit = 0;
+  bool menu_only = false;
+  bool map_only = false;
+
+  [[nodiscard]] constexpr bool MatchesMode(bool map_active) const noexcept {
+    if (map_only) return map_active;
+    if (menu_only) return !map_active;
+    return true;
+  }
+};
+
+inline constexpr std::array<FrontendEdgeZone, 10> kFrontendEdgeZones = {{
+    {FrontendEdgeAction::kPrevTab, {0.015f, 0.045f, 0.145f, 0.155f}, "< TAB", 1u << 0, false, false},
+    {FrontendEdgeAction::kNextTab, {0.855f, 0.045f, 0.985f, 0.155f}, "TAB >", 1u << 1, false, false},
+    {FrontendEdgeAction::kScrollUp, {0.865f, 0.195f, 0.985f, 0.345f}, "^ UP", 1u << 2, true, false},
+    {FrontendEdgeAction::kAdjustLeft, {0.865f, 0.375f, 0.923f, 0.520f}, "< -", 1u << 3, true, false},
+    {FrontendEdgeAction::kAdjustRight, {0.927f, 0.375f, 0.985f, 0.520f}, "+ >", 1u << 4, true, false},
+    {FrontendEdgeAction::kScrollDown, {0.865f, 0.550f, 0.985f, 0.700f}, "v DN", 1u << 5, true, false},
+    {FrontendEdgeAction::kZoomIn, {0.865f, 0.240f, 0.985f, 0.400f}, "ZOOM +", 1u << 6, false, true},
+    {FrontendEdgeAction::kZoomOut, {0.865f, 0.440f, 0.985f, 0.600f}, "ZOOM -", 1u << 7, false, true},
+    {FrontendEdgeAction::kBack, {0.855f, 0.785f, 0.985f, 0.925f}, "BACK", 1u << 8, false, false},
+    {FrontendEdgeAction::kResume, {0.015f, 0.785f, 0.145f, 0.925f}, "RESUME", 1u << 9, false, false},
+}};
+
+[[nodiscard]] inline const FrontendEdgeZone* HitTestFrontendEdgeZone(
+    Point point, bool map_active) noexcept {
+  for (const FrontendEdgeZone& zone : kFrontendEdgeZones) {
+    if (zone.MatchesMode(map_active) && zone.bounds.contains(point)) {
+      return &zone;
+    }
+  }
+  return nullptr;
+}
+
+class FrontendEdgeTransaction {
+ public:
+  [[nodiscard]] bool active() const noexcept { return active_; }
+  [[nodiscard]] uint64_t pointer_id() const noexcept { return pointer_id_; }
+  [[nodiscard]] uint32_t pressed_mask() const noexcept {
+    return (active_ && inside_) ? zone_.bit : 0u;
+  }
+
+  bool Begin(uint64_t pointer_id, uint64_t pointer_generation, bool map_active,
+             Point point) noexcept {
+    if (active_) return false;
+    const FrontendEdgeZone* hit = HitTestFrontendEdgeZone(point, map_active);
+    if (!hit) return false;
+    active_ = true;
+    inside_ = true;
+    pointer_id_ = pointer_id;
+    pointer_generation_ = pointer_generation;
+    map_active_ = map_active;
+    zone_ = *hit;
+    return true;
+  }
+
+  bool Move(uint64_t pointer_id, uint64_t pointer_generation, bool map_active,
+            Point point) noexcept {
+    if (!active_ || pointer_id != pointer_id_) return false;
+    if (pointer_generation != pointer_generation_ || map_active != map_active_) {
+      Reset();
+      return false;
+    }
+    inside_ = zone_.bounds.contains(point);
+    return true;
+  }
+
+  FrontendEdgeAction End(uint64_t pointer_id, uint64_t pointer_generation, bool map_active,
+                         Point point) noexcept {
+    if (!active_ || pointer_id != pointer_id_) return FrontendEdgeAction::kNone;
+    const bool valid = pointer_generation == pointer_generation_ &&
+                       map_active == map_active_ && zone_.bounds.contains(point);
+    const FrontendEdgeAction result = valid ? zone_.action : FrontendEdgeAction::kNone;
+    Reset();
+    return result;
+  }
+
+  bool Cancel(uint64_t pointer_id) noexcept {
+    if (!active_ || pointer_id != pointer_id_) return false;
+    Reset();
+    return true;
+  }
+
+  void Reset() noexcept {
+    active_ = false;
+    inside_ = false;
+    map_active_ = false;
+    pointer_id_ = 0;
+    pointer_generation_ = 0;
+    zone_ = {};
+  }
+
+ private:
+  uint64_t pointer_id_ = 0;
+  uint64_t pointer_generation_ = 0;
+  FrontendEdgeZone zone_{};
+  bool active_ = false;
+  bool inside_ = false;
+  bool map_active_ = false;
+};
+
+class FrontendSwipeScroll {
+ public:
+  static constexpr float kStepNormalized = 0.045f;
+
+  [[nodiscard]] bool active() const noexcept { return active_; }
+  [[nodiscard]] uint64_t pointer_id() const noexcept { return pointer_id_; }
+
+  bool Begin(uint64_t pointer_id, uint64_t pointer_generation, Point point) noexcept {
+    if (active_ || !std::isfinite(point.y)) return false;
+    active_ = true;
+    pointer_id_ = pointer_id;
+    pointer_generation_ = pointer_generation;
+    anchor_y_ = point.y;
+    return true;
+  }
+
+  int32_t Move(uint64_t pointer_id, uint64_t pointer_generation, Point point) noexcept {
+    if (!active_ || pointer_id != pointer_id_) return 0;
+    if (pointer_generation != pointer_generation_ || !std::isfinite(point.y)) {
+      Reset();
+      return 0;
+    }
+    const float delta_y = point.y - anchor_y_;
+    if (delta_y <= -kStepNormalized) {
+      anchor_y_ = point.y;
+      return 1;  // Dragging finger upward scrolls down the list.
+    }
+    if (delta_y >= kStepNormalized) {
+      anchor_y_ = point.y;
+      return -1;  // Dragging finger downward scrolls up the list.
+    }
+    return 0;
+  }
+
+  bool End(uint64_t pointer_id) noexcept {
+    if (!active_ || pointer_id != pointer_id_) return false;
+    Reset();
+    return true;
+  }
+
+  void Reset() noexcept {
+    active_ = false;
+    pointer_id_ = 0;
+    pointer_generation_ = 0;
+    anchor_y_ = 0.0f;
+  }
+
+ private:
+  uint64_t pointer_id_ = 0;
+  uint64_t pointer_generation_ = 0;
+  float anchor_y_ = 0.0f;
+  bool active_ = false;
+};
+
 class TapTransaction {
  public:
   bool Begin(uint64_t pointer_id, uint64_t pointer_generation, uint64_t geometry_generation,

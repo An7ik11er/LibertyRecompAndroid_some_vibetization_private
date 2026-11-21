@@ -83,6 +83,7 @@ enum class Action : uint32_t {
   kMapY = 73,
   kFrontendPause = 76,
   kFrontendAccept = 77,
+  kFrontendCancel = 78,
 };
 
 struct FrontendGeometry {
@@ -103,7 +104,13 @@ struct ReplaySnapshot {
   int32_t map_y = 0;
   int32_t zoom_steps = 0;
   bool accept = false;
+  bool cancel = false;
   bool pause = false;
+  bool resume = false;
+  bool up = false;
+  bool down = false;
+  bool left = false;
+  bool right = false;
   bool frontend_active = false;
   bool map_active = false;
   bool context_controls_active = false;
@@ -138,6 +145,10 @@ GTA4TouchExtension g_extension;
 VirtualKeySnapshot g_virtual_keys;
 
 gta4::touch::FrontendTransaction g_frontend_transaction;
+gta4::touch::FrontendEdgeTransaction g_frontend_edge_transaction;
+gta4::touch::FrontendSwipeScroll g_frontend_swipe_scroll;
+GTA4FrontendTouchOverlayState g_frontend_overlay_state;
+std::atomic<int32_t> g_pending_pause_tab_direction{0};
 gta4::touch::TapTransaction g_minimap_transaction;
 uint64_t g_hud_presentation_revision = 0;
 gta4::touch::TapTransaction g_weapon_transaction;
@@ -336,7 +347,62 @@ gta4::input::MapPanAction AccumulateMapOutput(const MapGestureOutput& output,
   return action;
 }
 
+void ApplyFrontendEdgeAction(gta4::touch::FrontendEdgeAction action) noexcept {
+  using E = gta4::touch::FrontendEdgeAction;
+  switch (action) {
+    case E::kPrevTab:
+      g_pending_pause_tab_direction.store(-1, std::memory_order_release);
+      break;
+    case E::kNextTab:
+      g_pending_pause_tab_direction.store(1, std::memory_order_release);
+      break;
+    case E::kScrollUp:
+      g_replay.up = true;
+      break;
+    case E::kScrollDown:
+      g_replay.down = true;
+      break;
+    case E::kAdjustLeft:
+      g_replay.left = true;
+      break;
+    case E::kAdjustRight:
+      g_replay.right = true;
+      break;
+    case E::kZoomIn:
+      ++g_replay.zoom_steps;
+      break;
+    case E::kZoomOut:
+      --g_replay.zoom_steps;
+      break;
+    case E::kBack:
+      g_replay.cancel = true;
+      break;
+    case E::kResume:
+      g_replay.resume = true;
+      break;
+    case E::kNone:
+      break;
+  }
+}
+
 void ProcessMapEvent(const AbsolutePointerEvent& event, uint64_t epoch) {
+  const Point norm_point = NormalizedPoint(event);
+  if (event.phase == AbsolutePointerPhase::kDown && !g_map_gesture.active() &&
+      g_frontend_edge_transaction.Begin(event.pointer_id, event.generation, true, norm_point)) {
+    return;
+  }
+  if (g_frontend_edge_transaction.active() &&
+      g_frontend_edge_transaction.pointer_id() == event.pointer_id) {
+    if (event.phase == AbsolutePointerPhase::kMove) {
+      g_frontend_edge_transaction.Move(event.pointer_id, event.generation, true, norm_point);
+    } else if (event.phase == AbsolutePointerPhase::kUp) {
+      ApplyFrontendEdgeAction(
+          g_frontend_edge_transaction.End(event.pointer_id, event.generation, true, norm_point));
+    } else {
+      g_frontend_edge_transaction.Cancel(event.pointer_id);
+    }
+    return;
+  }
   MapGestureOutput output;
   const Point point{event.x, event.y};
   switch (event.phase) {
@@ -372,8 +438,44 @@ void ProcessFrontendEvent(PPCContext& context, uint8_t* base,
                           const AbsolutePointerEvent& event, uint64_t epoch,
                           const FrontendGeometry& geometry) {
   const Point point = NormalizedPoint(event);
+  if (event.phase == AbsolutePointerPhase::kDown && !g_frontend_transaction.active() &&
+      !g_frontend_swipe_scroll.active() &&
+      g_frontend_edge_transaction.Begin(event.pointer_id, event.generation, false, point)) {
+    return;
+  }
+  if (g_frontend_edge_transaction.active() &&
+      g_frontend_edge_transaction.pointer_id() == event.pointer_id) {
+    if (event.phase == AbsolutePointerPhase::kMove) {
+      g_frontend_edge_transaction.Move(event.pointer_id, event.generation, false, point);
+    } else if (event.phase == AbsolutePointerPhase::kUp) {
+      ApplyFrontendEdgeAction(
+          g_frontend_edge_transaction.End(event.pointer_id, event.generation, false, point));
+    } else {
+      g_frontend_edge_transaction.Cancel(event.pointer_id);
+    }
+    return;
+  }
   const std::optional<FrontendRow> hit =
       gta4::touch::HitTestFrontendRow(geometry.rows, point);
+  if (event.phase == AbsolutePointerPhase::kDown && !hit &&
+      !g_frontend_transaction.active()) {
+    g_frontend_swipe_scroll.Begin(event.pointer_id, event.generation, point);
+    return;
+  }
+  if (g_frontend_swipe_scroll.active() &&
+      g_frontend_swipe_scroll.pointer_id() == event.pointer_id) {
+    if (event.phase == AbsolutePointerPhase::kMove) {
+      const int32_t step = g_frontend_swipe_scroll.Move(event.pointer_id, event.generation, point);
+      if (step < 0) {
+        g_replay.up = true;
+      } else if (step > 0) {
+        g_replay.down = true;
+      }
+    } else {
+      g_frontend_swipe_scroll.End(event.pointer_id);
+    }
+    return;
+  }
   switch (event.phase) {
     case AbsolutePointerPhase::kDown:
       if (hit && g_frontend_transaction.Begin(event.pointer_id, event.generation,
@@ -489,9 +591,24 @@ bool ProcessWeaponHudEvent(const AbsolutePointerEvent& event, uint64_t epoch) {
 
 void ResetTransactions() noexcept {
   g_frontend_transaction.Reset();
+  g_frontend_edge_transaction.Reset();
+  g_frontend_swipe_scroll.Reset();
   g_minimap_transaction.Reset();
   g_weapon_transaction.Reset();
   g_map_gesture.Reset();
+}
+
+void PublishFrontendOverlayState(bool active, bool map_active, uint32_t pressed_mask,
+                                 const std::vector<FrontendRow>* rows) {
+  std::lock_guard lock(g_geometry_mutex);
+  g_frontend_overlay_state.active = active;
+  g_frontend_overlay_state.map_active = map_active;
+  g_frontend_overlay_state.pressed_mask = pressed_mask;
+  if (active && !map_active && rows) {
+    g_frontend_overlay_state.rows = *rows;
+  } else {
+    g_frontend_overlay_state.rows.clear();
+  }
 }
 
 void ApplyMapZoom(uint8_t* base, uint64_t epoch) noexcept {
@@ -586,6 +703,7 @@ void GTA4_TouchConsumePoll(PPCContext& context, uint8_t* base, uint64_t epoch) {
     while (rex::input::TryDequeueAbsolutePointerEvent(&discarded)) {
     }
     ResetTransactions();
+    PublishFrontendOverlayState(false, false, 0u, nullptr);
     DisableContextControls(extension, context, base, epoch);
     FreezeVirtualKeys(extension, epoch, false);
     return;
@@ -609,6 +727,10 @@ void GTA4_TouchConsumePoll(PPCContext& context, uint8_t* base, uint64_t epoch) {
 
   if (!frontend_navigation_active) {
     g_frontend_transaction.Reset();
+    g_frontend_swipe_scroll.Reset();
+  }
+  if (!frontend_active || editor_captures) {
+    g_frontend_edge_transaction.Reset();
   }
   if (!map_active || editor_captures) {
     g_map_gesture.Reset();
@@ -649,6 +771,10 @@ void GTA4_TouchConsumePoll(PPCContext& context, uint8_t* base, uint64_t epoch) {
   }
 
   ApplyMapZoom(base, epoch);
+  PublishFrontendOverlayState(
+      frontend_active && !editor_captures, map_active && !editor_captures,
+      (frontend_active && !editor_captures) ? g_frontend_edge_transaction.pressed_mask() : 0u,
+      frontend_navigation_active ? &frontend.rows : nullptr);
   if (context_controls_active) {
     g_context_controls_were_active = true;
   }
@@ -687,10 +813,17 @@ void GTA4_TouchObserveControlReplay(PPCContext& context, uint8_t* base, uint32_t
       changed |= MergeSignedAction(base, control, Action::kMapX, g_replay.map_x);
       changed |= MergeSignedAction(base, control, Action::kMapY, g_replay.map_y);
     }
+    changed |= MergeButton(base, control, Action::kFrontendUp, g_replay.up ? kPressed : 0);
+    changed |= MergeButton(base, control, Action::kFrontendDown, g_replay.down ? kPressed : 0);
+    changed |= MergeButton(base, control, Action::kFrontendLeft, g_replay.left ? kPressed : 0);
+    changed |= MergeButton(base, control, Action::kFrontendRight, g_replay.right ? kPressed : 0);
     changed |= MergeButton(base, control, Action::kFrontendAccept,
                            g_replay.accept ? kPressed : 0);
-    changed |= MergeButton(base, control, Action::kFrontendPause,
-                           g_replay.pause && rex::input::TouchControlsActive() ? kPressed : 0);
+    changed |= MergeButton(base, control, Action::kFrontendCancel,
+                           g_replay.cancel ? kPressed : 0);
+    changed |= MergeButton(
+        base, control, Action::kFrontendPause,
+        (g_replay.resume || (g_replay.pause && rex::input::TouchControlsActive())) ? kPressed : 0);
   }
   if (changed) {
     StoreU32(base, control + kLastInputTimeOffset, LoadU32(base, kGameInputTimeAddress));
@@ -900,4 +1033,13 @@ extern "C" void sub_8239C468(PPCContext& context, uint8_t* base) {
                                      .right = float(bounds.right), .bottom = float(bounds.bottom)} :
                                 Rect{});
   g_radar_capture = previous;
+}
+
+int32_t GTA4_TouchConsumePendingPauseTabDirection() noexcept {
+  return g_pending_pause_tab_direction.exchange(0, std::memory_order_acq_rel);
+}
+
+GTA4FrontendTouchOverlayState GTA4_ReadFrontendTouchOverlayState() noexcept {
+  std::lock_guard lock(g_geometry_mutex);
+  return g_frontend_overlay_state;
 }

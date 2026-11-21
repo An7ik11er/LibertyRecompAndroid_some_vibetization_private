@@ -2,6 +2,9 @@
 
 #include <array>
 #include <cstdint>
+#include <vector>
+
+#include "gta4_touch_policy.h"
 
 struct PPCContext;
 
@@ -54,3 +57,13 @@ bool GTA4_TouchTitleInputOwned() noexcept;
 
 // Multiplexed by legal_screen_trace.cpp's existing HUD text hook.
 void GTA4_TouchObserveHudSubmit(const PPCContext& context, uint8_t* base) noexcept;
+
+struct GTA4FrontendTouchOverlayState {
+  bool active = false;
+  bool map_active = false;
+  uint32_t pressed_mask = 0;
+  std::vector<gta4::touch::FrontendRow> rows;
+};
+
+int32_t GTA4_TouchConsumePendingPauseTabDirection() noexcept;
+GTA4FrontendTouchOverlayState GTA4_ReadFrontendTouchOverlayState() noexcept;

@@ -42,7 +42,16 @@ void DrawContextTouchLayer(ImDrawList* draw, ImFont* font, float font_size,
       const auto hi = point(control.maximum_x, control.maximum_y);
       const float rounding = radius * 0.18f;
       draw->AddRectFilled(lo, hi, color(10, 10, 10, active ? 140.0f : 85.0f), rounding);
-      draw->AddRect(lo, hi, color(255, 255, 255, active ? 225.0f : 105.0f), rounding);
+      const float pad_x = std::min({2.5f, lo.x, std::max(0.0f, logical_width - hi.x)});
+      const float pad_y = std::min({2.5f, lo.y, std::max(0.0f, logical_height - hi.y)});
+      if (pad_x > 0.5f && pad_y > 0.5f) {
+        draw->AddRect(ImVec2(lo.x - pad_x, lo.y - pad_y), ImVec2(hi.x + pad_x, hi.y + pad_y),
+                      active ? color(255, 195, 80, 130.0f) : color(135, 215, 255, 70.0f),
+                      rounding + 2.0f, 0, 2.0f);
+      }
+      draw->AddRect(lo, hi,
+                    active ? color(255, 220, 125, 245.0f) : color(170, 225, 255, 175.0f),
+                    rounding, 0, active ? 2.4f : 1.6f);
       const float label_size = std::min(font_size, radius * 0.22f);
       const auto size = font->CalcTextSizeA(label_size, FLT_MAX, 0.0f, control.label.data());
       draw->AddText(font, label_size, ImVec2(center.x - size.x * 0.5f, lo.y + rounding),
@@ -75,10 +84,20 @@ void DrawContextTouchLayer(ImDrawList* draw, ImFont* font, float font_size,
       }
       continue;
     }
+    const float max_halo = std::max(
+        0.0f, std::min({center.x, center.y, logical_width - center.x, logical_height - center.y}) -
+                  radius);
+    const float halo_delta = std::min(std::max(1.5f, radius * 0.08f), max_halo);
+    if (halo_delta >= 0.75f) {
+      draw->AddCircle(center, radius + halo_delta,
+                      active ? color(255, 190, 75, 150.0f) : color(120, 205, 255, 70.0f), 48,
+                      std::max(1.5f, radius * 0.045f));
+    }
     draw->AddCircleFilled(center, radius, active ? color(236, 135, 42, 255.0f)
                                                : color(12, 18, 27, 210.0f), 48);
-    draw->AddCircle(center, radius, color(255, 255, 255, 255.0f), 48,
-                    std::max(1.0f, radius * 0.025f));
+    draw->AddCircle(center, radius,
+                    active ? color(255, 230, 140, 255.0f) : color(185, 230, 255, 235.0f), 48,
+                    std::max(1.3f, radius * (active ? 0.045f : 0.032f)));
     if (control.kind == ContextTouchControlKind::kMovementStick || control.kind == ContextTouchControlKind::kRightStick) {
       const bool right = control.kind == ContextTouchControlKind::kRightStick;
       const float x = std::clamp(right ? (input ? input->right_x : 0.0f) : (input ? input->movement_x : 0.0f), -255.0f, 255.0f) / 255.0f;
@@ -123,5 +142,92 @@ void DrawContextTouchOverlay(ImDrawList* draw, ImFont* font, float font_size,
         snapshot.fade_alpha * snapshot.outgoing_alpha, logical_width, logical_height, resolver, icon_context);
   DrawContextTouchLayer(draw, font, font_size, snapshot.layout, &snapshot,
       snapshot.fade_alpha * snapshot.layout_alpha, logical_width, logical_height, resolver, icon_context);
+}
+
+void DrawContextTouchFrontendOverlay(ImDrawList* draw, ImFont* font, float font_size,
+                                     const ContextTouchFrontendOverlayView& view,
+                                     float logical_width, float logical_height) {
+  if (!draw || !font || !view.active || !std::isfinite(font_size) || font_size <= 0.0f ||
+      !std::isfinite(logical_width) || !std::isfinite(logical_height) ||
+      logical_width <= 0.0f || logical_height <= 0.0f) {
+    return;
+  }
+
+  // Subtle hitbox outlines around selectable Pause Menu rows so tap targets are clear.
+  if (!view.map_active) {
+    for (const auto& row : view.rows) {
+      if (!row.selectable || !row.bounds.valid()) continue;
+      const float x0 = std::clamp(row.bounds.left, 0.0f, 1.0f) * logical_width;
+      const float y0 = std::clamp(row.bounds.top, 0.0f, 1.0f) * logical_height;
+      const float x1 = std::clamp(row.bounds.right, 0.0f, 1.0f) * logical_width;
+      const float y1 = std::clamp(row.bounds.bottom, 0.0f, 1.0f) * logical_height;
+      if (x1 - x0 < 4.0f || y1 - y0 < 4.0f) continue;
+      const ImVec2 lo(x0, y0);
+      const ImVec2 hi(x1, y1);
+      draw->AddRect(lo, hi, IM_COL32(120, 210, 255, 65), 4.0f, 0, 1.0f);
+      const float tick = std::min({10.0f, (x1 - x0) * 0.12f, (y1 - y0) * 0.35f});
+      const ImU32 corner = IM_COL32(160, 228, 255, 140);
+      draw->AddLine(lo, ImVec2(x0 + tick, y0), corner, 1.5f);
+      draw->AddLine(lo, ImVec2(x0, y0 + tick), corner, 1.5f);
+      draw->AddLine(ImVec2(x1 - tick, y1), hi, corner, 1.5f);
+      draw->AddLine(ImVec2(x1, y1 - tick), hi, corner, 1.5f);
+    }
+  }
+
+  // Edge action hitboxes (< TAB, TAB >, UP, < -, + >, DN, ZOOM +/-, BACK, RESUME).
+  for (const auto& zone : gta4::touch::kFrontendEdgeZones) {
+    if (!zone.MatchesMode(view.map_active)) continue;
+    const ImVec2 lo(zone.bounds.left * logical_width, zone.bounds.top * logical_height);
+    const ImVec2 hi(zone.bounds.right * logical_width, zone.bounds.bottom * logical_height);
+    const float w = hi.x - lo.x;
+    const float h = hi.y - lo.y;
+    if (w <= 2.0f || h <= 2.0f) continue;
+    const bool pressed = (view.pressed_mask & zone.bit) != 0u;
+    const float rounding = std::clamp(std::min(w, h) * 0.16f, 6.0f, 14.0f);
+
+    draw->AddRect(ImVec2(std::max(0.0f, lo.x - 2.0f), std::max(0.0f, lo.y - 2.0f)),
+                  ImVec2(std::min(logical_width, hi.x + 2.0f),
+                         std::min(logical_height, hi.y + 2.0f)),
+                  pressed ? IM_COL32(255, 195, 80, 165) : IM_COL32(110, 205, 255, 65),
+                  rounding + 2.0f, 0, 2.0f);
+    draw->AddRectFilled(lo, hi,
+                        pressed ? IM_COL32(236, 135, 42, 205) : IM_COL32(10, 18, 28, 128),
+                        rounding);
+    draw->AddRect(lo, hi,
+                  pressed ? IM_COL32(255, 232, 145, 255) : IM_COL32(145, 222, 255, 205),
+                  rounding, 0, pressed ? 2.6f : 1.7f);
+
+    const ImVec2 natural = font->CalcTextSizeA(font_size, FLT_MAX, 0.0f, zone.label);
+    const float fitted = natural.x > 0.0f
+        ? std::min({font_size * 0.95f, font_size * (w * 0.84f) / natural.x, h * 0.42f})
+        : font_size;
+    const ImVec2 text_size = font->CalcTextSizeA(fitted, FLT_MAX, 0.0f, zone.label);
+    const ImVec2 text_pos(lo.x + (w - text_size.x) * 0.5f, lo.y + (h - text_size.y) * 0.5f);
+    draw->AddText(font, fitted, text_pos,
+                  pressed ? IM_COL32(255, 255, 255, 255) : IM_COL32(235, 246, 255, 240),
+                  zone.label);
+  }
+
+  // Compact bottom gesture hint strip.
+  const char* hint = view.map_active
+      ? "Map: 1-finger drag = Pan  |  Tap = Waypoint  |  Pinch / ZOOM = Scale  |  Edges = Tabs / Back"
+      : "Menu: Tap row = Select  |  Swipe empty = Scroll  |  Edges = Tabs / Scroll / Adjust / Back";
+  const float hint_font = std::clamp(logical_height * 0.022f, 11.0f, font_size * 0.85f);
+  const ImVec2 hint_nat = font->CalcTextSizeA(hint_font, FLT_MAX, 0.0f, hint);
+  const float max_hint_w = logical_width * 0.66f;
+  const float fitted_hint = hint_nat.x > max_hint_w && hint_nat.x > 0.0f
+      ? hint_font * (max_hint_w / hint_nat.x)
+      : hint_font;
+  const ImVec2 hint_size = font->CalcTextSizeA(fitted_hint, FLT_MAX, 0.0f, hint);
+  const float pad_x = 12.0f;
+  const float pad_y = 4.0f;
+  const float cx = logical_width * 0.5f;
+  const float by = logical_height * 0.985f;
+  const ImVec2 pill_lo(cx - hint_size.x * 0.5f - pad_x, by - hint_size.y - pad_y * 2.0f);
+  const ImVec2 pill_hi(cx + hint_size.x * 0.5f + pad_x, by);
+  draw->AddRectFilled(pill_lo, pill_hi, IM_COL32(10, 16, 24, 150), 8.0f);
+  draw->AddRect(pill_lo, pill_hi, IM_COL32(125, 210, 255, 130), 8.0f, 0, 1.2f);
+  draw->AddText(font, fitted_hint, ImVec2(cx - hint_size.x * 0.5f, pill_lo.y + pad_y),
+                IM_COL32(220, 238, 255, 225), hint);
 }
 }  // namespace gta4::input
