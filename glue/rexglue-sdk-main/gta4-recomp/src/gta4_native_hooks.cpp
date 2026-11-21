@@ -8987,3 +8987,10 @@ extern "C" void sub_82A467D8(PPCContext& ctx, uint8_t* base) {
 #if ENABLE_BATCH11_HOOKS
 #include "gta4_batch11_hooks.inc"
 #endif
+
+// Batch 12 Verified Water & Bullet GJK NEON Hooks (100% Bit-Exact on Hardware: sub_8228C590 8.13x, sub_829BF170 1.35x/1.51x net) - toggleable
+#define ENABLE_BATCH12_HOOKS 0
+#define ENABLE_BATCH12_VERIFIED_HOOKS 1
+#if ENABLE_BATCH12_VERIFIED_HOOKS
+#include "gta4_batch12_hooks.inc"
+#endif
