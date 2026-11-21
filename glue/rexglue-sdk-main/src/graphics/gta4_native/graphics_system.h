@@ -4141,7 +4141,8 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     bool temporal_jitter = false;
     NativeUploadAllocation allocation{};
   };
-  std::array<FastSharedConstMemo, 256> fast_shared_memo_cache_{};
+  FastSharedConstMemo last_shared_draw_memo_{};
+  std::array<FastSharedConstMemo, 1024> fast_shared_memo_cache_{};
   uint32_t ubo_rewritten_shaders_ = 0;
   uint64_t ubo_rewritten_loads_ = 0;
   bool BindUboConstantBanks(VkCommandBuffer command_buffer, VkPipelineLayout layout,

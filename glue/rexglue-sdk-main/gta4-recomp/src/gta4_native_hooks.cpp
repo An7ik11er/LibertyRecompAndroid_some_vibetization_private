@@ -8968,6 +8968,9 @@ extern "C" void sub_82A467D8(PPCContext& ctx, uint8_t* base) {
 #include "gta4_batch8_hooks.inc"
 #endif
 
+// Runtime COcclusion diagnostics & A/B toggle (off by default unless --gta4_occlusion_report=true)
+#include "gta4_occlusion_report.inc"
+
 // Batch 9 Verified Physics & Common Leaf Hooks (100% Bit-Exact on Hardware: sub_822A0CC0 4.41x, sub_822A2388 2.99x, sub_822A22C0 1.55x, sub_821E3670 1.09x, sub_821671F8 1.17x) - toggleable
 #define ENABLE_BATCH9_VERIFIED_HOOKS 1
 #if ENABLE_BATCH9_VERIFIED_HOOKS

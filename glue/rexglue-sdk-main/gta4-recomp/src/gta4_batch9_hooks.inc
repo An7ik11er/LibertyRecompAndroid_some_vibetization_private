@@ -120,7 +120,7 @@ struct Vec3F { float x, y, z; };
 
 } // namespace ray_box_cull_detail
 
-extern "C" void sub_822A0CC0(PPCContext& ctx, uint8_t* base) {
+static inline void sub_822A0CC0_Batch9Impl(PPCContext& ctx, uint8_t* base) {
     using namespace ray_box_cull_detail;
 
     constexpr uint32_t kAddrMaskOr  = 0x831AB6D0u; // 0x831B0000 - 18736
@@ -386,6 +386,31 @@ extern "C" void sub_822A0CC0(PPCContext& ctx, uint8_t* base) {
 #endif
 }
 
+extern "C" void sub_822A0CC0(PPCContext& ctx, uint8_t* base) {
+#ifdef GTA4_OCCLUSION_REPORT_DEFINED
+    const bool report = REXCVAR_GET(gta4_occlusion_report);
+    const bool disabled = REXCVAR_GET(gta4_disable_batch9_occlusion_hooks);
+    if (!report && !disabled) [[likely]] {
+        sub_822A0CC0_Batch9Impl(ctx, base);
+        return;
+    }
+    const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+    if (disabled) {
+        __imp__sub_822A0CC0(ctx, base);
+        if (report) {
+            gta4::occlusion_report::RecordLeaf("sub_822A0CC0", lr, (ctx.r3.u32 & 0xFFu) != 0, false, false);
+        }
+        return;
+    }
+    PPCContext orig_ctx = ctx;
+    sub_822A0CC0_Batch9Impl(ctx, base);
+    __imp__sub_822A0CC0(orig_ctx, base);
+    gta4::occlusion_report::RecordLeaf("sub_822A0CC0", lr, (ctx.r3.u32 & 0xFFu) != 0, true, (orig_ctx.r3.u32 & 0xFFu) != 0);
+#else
+    sub_822A0CC0_Batch9Impl(ctx, base);
+#endif
+}
+
 // --- End sub_822A0CC0_opt.inc ---
 
 // --- Begin sub_822A2388_opt.inc ---
@@ -465,7 +490,7 @@ struct SoA4 {
 
 } // namespace phys_box_maxdot_detail
 
-extern "C" void sub_822A2388(PPCContext& ctx, uint8_t* base) {
+static inline void sub_822A2388_Batch9Impl(PPCContext& ctx, uint8_t* base) {
     using namespace phys_box_maxdot_detail;
 
     constexpr uint32_t kAddrMaskOr  = 0x831AB6D0u; // 0x831B0000 - 18736
@@ -701,6 +726,31 @@ extern "C" void sub_822A2388(PPCContext& ctx, uint8_t* base) {
     ctx.r3.s64 = 0;
 }
 
+extern "C" void sub_822A2388(PPCContext& ctx, uint8_t* base) {
+#ifdef GTA4_OCCLUSION_REPORT_DEFINED
+    const bool report = REXCVAR_GET(gta4_occlusion_report);
+    const bool disabled = REXCVAR_GET(gta4_disable_batch9_occlusion_hooks);
+    if (!report && !disabled) [[likely]] {
+        sub_822A2388_Batch9Impl(ctx, base);
+        return;
+    }
+    const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+    if (disabled) {
+        __imp__sub_822A2388(ctx, base);
+        if (report) {
+            gta4::occlusion_report::RecordLeaf("sub_822A2388", lr, (ctx.r3.u32 & 0xFFu) != 0, false, false);
+        }
+        return;
+    }
+    PPCContext orig_ctx = ctx;
+    sub_822A2388_Batch9Impl(ctx, base);
+    __imp__sub_822A2388(orig_ctx, base);
+    gta4::occlusion_report::RecordLeaf("sub_822A2388", lr, (ctx.r3.u32 & 0xFFu) != 0, true, (orig_ctx.r3.u32 & 0xFFu) != 0);
+#else
+    sub_822A2388_Batch9Impl(ctx, base);
+#endif
+}
+
 // --- End sub_822A2388_opt.inc ---
 
 // --- Begin sub_822A22C0_opt.inc ---
@@ -748,7 +798,7 @@ namespace phys_sphere_cull_detail {
 
 } // namespace phys_sphere_cull_detail
 
-extern "C" void sub_822A22C0(PPCContext& ctx, uint8_t* base) {
+static inline void sub_822A22C0_Batch9Impl(PPCContext& ctx, uint8_t* base) {
     using namespace phys_sphere_cull_detail;
 
     const uint32_t base_arr   = REX_LOAD_U32(ctx.r3.u32 + 0u);
@@ -892,6 +942,31 @@ extern "C" void sub_822A22C0(PPCContext& ctx, uint8_t* base) {
 #endif
 
     ctx.r3.s64 = 0;
+}
+
+extern "C" void sub_822A22C0(PPCContext& ctx, uint8_t* base) {
+#ifdef GTA4_OCCLUSION_REPORT_DEFINED
+    const bool report = REXCVAR_GET(gta4_occlusion_report);
+    const bool disabled = REXCVAR_GET(gta4_disable_batch9_occlusion_hooks);
+    if (!report && !disabled) [[likely]] {
+        sub_822A22C0_Batch9Impl(ctx, base);
+        return;
+    }
+    const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+    if (disabled) {
+        __imp__sub_822A22C0(ctx, base);
+        if (report) {
+            gta4::occlusion_report::RecordLeaf("sub_822A22C0", lr, (ctx.r3.u32 & 0xFFu) != 0, false, false);
+        }
+        return;
+    }
+    PPCContext orig_ctx = ctx;
+    sub_822A22C0_Batch9Impl(ctx, base);
+    __imp__sub_822A22C0(orig_ctx, base);
+    gta4::occlusion_report::RecordLeaf("sub_822A22C0", lr, (ctx.r3.u32 & 0xFFu) != 0, true, (orig_ctx.r3.u32 & 0xFFu) != 0);
+#else
+    sub_822A22C0_Batch9Impl(ctx, base);
+#endif
 }
 
 // --- End sub_822A22C0_opt.inc ---

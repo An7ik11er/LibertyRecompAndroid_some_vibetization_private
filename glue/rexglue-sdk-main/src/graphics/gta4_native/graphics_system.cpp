@@ -406,7 +406,7 @@ REXCVAR_DEFINE_UINT32(gta4_native_debug_gpu_attribution, 0, "GTA IV/Graphics/Nat
                       "Measurement only, breaks the image: 1 = scene draws get an empty scissor "
                       "(vertex and state work only), 2 = scene draws bind state but are not issued")
     .range(0, 2);
-REXCVAR_DEFINE_BOOL(gta4_native_merge_indexed_draws, true, "GTA IV/Graphics/Native Renderer",
+REXCVAR_DEFINE_BOOL(gta4_native_merge_indexed_draws, false, "GTA IV/Graphics/Native Renderer",
                     "Record consecutive indexed triangle-list draws with identical state and "
                     "adjacent index ranges as one draw");
 REXCVAR_DEFINE_DOUBLE(gta4_native_depth_bias_constant_scale, 1.0, "GTA IV/Graphics/Native Renderer",
@@ -22974,6 +22974,10 @@ if (!PrepareFrameDescriptorPool(descriptor_pool_draw_count, combined_descriptor_
             candidate.key.layout_epoch != descriptor_key.layout_epoch) {
           continue;
         }
+        if (candidate.dirty_mask == stage_mask) [[likely]] {
+          hit_pos = pos;
+          break;
+        }
         bool match = true;
         for (uint32_t cmp_mask = candidate.dirty_mask | stage_mask; cmp_mask;
              cmp_mask &= cmp_mask - 1) {
@@ -27034,51 +27038,73 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
 
   const uint64_t pipeline_serial = command.pipeline_state.serial();
   const uint32_t command_device = CommandDevice(command.type, command.bytes.data());
-  const size_t fast_shared_slot =
-      (size_t(pipeline_serial * 0x9E3779B97F4A7C15ull) ^
-       size_t((reinterpret_cast<uintptr_t>(command.fixed_function_state.get()) >> 6) * 0xBF58476D1CE4E5B9ull) ^
-       size_t(command.texture_inputs_signature) ^
-       size_t(command_device) ^
-       size_t(vertex_booleans) ^ (size_t(pixel_booleans) << 16)) &
-      (fast_shared_memo_cache_.size() - 1);
-  FastSharedConstMemo& s_fast_shared_memo = fast_shared_memo_cache_[fast_shared_slot];
-
+  const EnvironmentalDataV2* command_env =
+      command.extras ? command.extras->environmental_data.get() : nullptr;
   const StateVersionStamp boolean_ver =
       command.shader_state->versions.Get(DirtyStateComponent::kBooleanConstants);
-  const bool can_reuse_shared_allocation =
+
+  const auto matches_memo = [&](const FastSharedConstMemo& memo) -> bool {
+    // Check most discriminating fields first for fast rejection (3-4 cycles)
+    return memo.pipeline_serial == pipeline_serial &&
+           memo.fixed_state == command.fixed_function_state.get() &&
+           memo.texture_inputs_sig == command.texture_inputs_signature &&
+           memo.descriptor_page == command.descriptor_page &&
+           memo.descriptor_copy == command.descriptor_copy &&
+           memo.image_epoch == command.image_descriptor_epoch &&
+           memo.sampler_epoch == command.sampler_descriptor_epoch &&
+           memo.used_texture_mask == command.used_texture_mask &&
+           memo.frame == diagnostic_submitted_frame_ &&
+           memo.cb == command_buffer &&
+           memo.device == command_device &&
+           memo.env_data == command_env &&
+           memo.vertex_booleans == vertex_booleans &&
+           memo.pixel_booleans == pixel_booleans &&
+           memo.boolean_version == boolean_ver &&
+           memo.cached_epoch == command.cached_descriptor_epoch &&
+           memo.width == width &&
+           memo.height == height &&
+           memo.logical_width == logical_width &&
+           memo.logical_height == logical_height &&
+           memo.samples == uint32_t(samples) &&
+           memo.color_mask == target.color_attachment_mask &&
+           memo.temporal_mode == command.temporal_composite_mode &&
+           memo.split_postfx == command.split_postfx_applied &&
+           memo.is_reflection == target.is_reflection &&
+           memo.temporal_jitter == target.temporal_jitter;
+  };
+
+  const bool valid_signature =
       pipeline_serial != 0 &&
-      (command.texture_inputs_signature != 0 || command.used_texture_mask == 0) &&
-      s_fast_shared_memo.frame              == diagnostic_submitted_frame_ &&
-      s_fast_shared_memo.cb                 == command_buffer &&
-      s_fast_shared_memo.pipeline_serial    == pipeline_serial &&
-      s_fast_shared_memo.device             == command_device &&
-      s_fast_shared_memo.fixed_state        == command.fixed_function_state.get() &&
-      s_fast_shared_memo.env_data           == (command.extras ? command.extras->environmental_data.get() : nullptr) &&
-      s_fast_shared_memo.texture_inputs_sig == command.texture_inputs_signature &&
-      s_fast_shared_memo.used_texture_mask  == command.used_texture_mask &&
-      s_fast_shared_memo.vertex_booleans    == vertex_booleans &&
-      s_fast_shared_memo.pixel_booleans     == pixel_booleans &&
-      s_fast_shared_memo.boolean_version    == boolean_ver &&
-      s_fast_shared_memo.descriptor_page    == command.descriptor_page &&
-      s_fast_shared_memo.descriptor_copy    == command.descriptor_copy &&
-      s_fast_shared_memo.image_epoch        == command.image_descriptor_epoch &&
-      s_fast_shared_memo.sampler_epoch      == command.sampler_descriptor_epoch &&
-      s_fast_shared_memo.cached_epoch       == command.cached_descriptor_epoch &&
-      s_fast_shared_memo.width              == width &&
-      s_fast_shared_memo.height             == height &&
-      s_fast_shared_memo.logical_width      == logical_width &&
-      s_fast_shared_memo.logical_height     == logical_height &&
-      s_fast_shared_memo.samples            == uint32_t(samples) &&
-      s_fast_shared_memo.color_mask         == target.color_attachment_mask &&
-      s_fast_shared_memo.temporal_mode      == command.temporal_composite_mode &&
-      s_fast_shared_memo.split_postfx       == command.split_postfx_applied &&
-      s_fast_shared_memo.is_reflection      == target.is_reflection &&
-      s_fast_shared_memo.temporal_jitter    == target.temporal_jitter;
+      (command.texture_inputs_signature != 0 || command.used_texture_mask == 0);
+
+  bool can_reuse_shared_allocation = false;
+  FastSharedConstMemo* active_shared_memo = nullptr;
+
+  if (valid_signature && matches_memo(last_shared_draw_memo_)) [[likely]] {
+    can_reuse_shared_allocation = true;
+    active_shared_memo = &last_shared_draw_memo_;
+  } else {
+    const size_t fast_shared_slot =
+        (size_t(pipeline_serial * 0x9E3779B97F4A7C15ull) ^
+         size_t((reinterpret_cast<uintptr_t>(command.fixed_function_state.get()) >> 6) * 0xBF58476D1CE4E5B9ull) ^
+         size_t(command.texture_inputs_signature) ^
+         size_t(command_device) ^
+         size_t(vertex_booleans) ^ (size_t(pixel_booleans) << 16)) &
+        (fast_shared_memo_cache_.size() - 1);
+    FastSharedConstMemo& s_fast_shared_memo = fast_shared_memo_cache_[fast_shared_slot];
+    if (valid_signature && matches_memo(s_fast_shared_memo)) [[likely]] {
+      can_reuse_shared_allocation = true;
+      active_shared_memo = &s_fast_shared_memo;
+      last_shared_draw_memo_ = s_fast_shared_memo;
+    } else {
+      active_shared_memo = &s_fast_shared_memo;
+    }
+  }
 
   uint32_t shared_color_output_info_0 = 0;
   if (can_reuse_shared_allocation) [[likely]] {
-    shared_constants_allocation = s_fast_shared_memo.allocation;
-    shared_color_output_info_0 = s_fast_shared_memo.color_output_info_0;
+    shared_constants_allocation = active_shared_memo->allocation;
+    shared_color_output_info_0 = active_shared_memo->color_output_info_0;
   } else {
   NativeSharedConstantSemanticKey shared_key{};
   shared_key.texture_descriptor_indices = command.texture_descriptor_indices;
@@ -27144,8 +27170,6 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
   shared_key.modern_effects_enabled = modern_shader_frame_.settings().enabled;
   shared_key.viewport_bits = fixed.viewport_bits;
   shared_key.water_reflection = target.is_reflection && target.reflection.family == ReflectionFamily::kWater;
-  const EnvironmentalDataV2* command_env =
-      command.extras ? command.extras->environmental_data.get() : nullptr;
   shared_key.environmental_data_hash = command.environmental_data_hash;
   shared_key.environmental_sequence = command_env ? command_env->source_sequence : 0;
   shared_key.device = CommandDevice(command.type, command.bytes.data());
@@ -27326,34 +27350,35 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
   }
 
   shared_color_output_info_0 = shared_key.color_output_info[0];
-  s_fast_shared_memo.frame              = diagnostic_submitted_frame_;
-  s_fast_shared_memo.cb                 = command_buffer;
-  s_fast_shared_memo.pipeline_serial    = pipeline_serial;
-  s_fast_shared_memo.device             = command_device;
-  s_fast_shared_memo.fixed_state        = command.fixed_function_state.get();
-  s_fast_shared_memo.env_data           = command_env;
-  s_fast_shared_memo.texture_inputs_sig = command.texture_inputs_signature;
-  s_fast_shared_memo.used_texture_mask  = command.used_texture_mask;
-  s_fast_shared_memo.vertex_booleans    = vertex_booleans;
-  s_fast_shared_memo.pixel_booleans     = pixel_booleans;
-  s_fast_shared_memo.boolean_version    = boolean_ver;
-  s_fast_shared_memo.descriptor_page    = command.descriptor_page;
-  s_fast_shared_memo.descriptor_copy    = command.descriptor_copy;
-  s_fast_shared_memo.image_epoch        = command.image_descriptor_epoch;
-  s_fast_shared_memo.sampler_epoch      = command.sampler_descriptor_epoch;
-  s_fast_shared_memo.cached_epoch       = command.cached_descriptor_epoch;
-  s_fast_shared_memo.width              = width;
-  s_fast_shared_memo.height             = height;
-  s_fast_shared_memo.logical_width      = logical_width;
-  s_fast_shared_memo.logical_height     = logical_height;
-  s_fast_shared_memo.samples            = uint32_t(samples);
-  s_fast_shared_memo.color_mask         = target.color_attachment_mask;
-  s_fast_shared_memo.color_output_info_0= shared_color_output_info_0;
-  s_fast_shared_memo.temporal_mode      = command.temporal_composite_mode;
-  s_fast_shared_memo.split_postfx       = command.split_postfx_applied;
-  s_fast_shared_memo.is_reflection      = target.is_reflection;
-  s_fast_shared_memo.temporal_jitter    = target.temporal_jitter;
-  s_fast_shared_memo.allocation         = shared_constants_allocation;
+  active_shared_memo->frame              = diagnostic_submitted_frame_;
+  active_shared_memo->cb                 = command_buffer;
+  active_shared_memo->pipeline_serial    = pipeline_serial;
+  active_shared_memo->device             = command_device;
+  active_shared_memo->fixed_state        = command.fixed_function_state.get();
+  active_shared_memo->env_data           = command_env;
+  active_shared_memo->texture_inputs_sig = command.texture_inputs_signature;
+  active_shared_memo->used_texture_mask  = command.used_texture_mask;
+  active_shared_memo->vertex_booleans    = vertex_booleans;
+  active_shared_memo->pixel_booleans     = pixel_booleans;
+  active_shared_memo->boolean_version    = boolean_ver;
+  active_shared_memo->descriptor_page    = command.descriptor_page;
+  active_shared_memo->descriptor_copy    = command.descriptor_copy;
+  active_shared_memo->image_epoch        = command.image_descriptor_epoch;
+  active_shared_memo->sampler_epoch      = command.sampler_descriptor_epoch;
+  active_shared_memo->cached_epoch       = command.cached_descriptor_epoch;
+  active_shared_memo->width              = width;
+  active_shared_memo->height             = height;
+  active_shared_memo->logical_width      = logical_width;
+  active_shared_memo->logical_height     = logical_height;
+  active_shared_memo->samples            = uint32_t(samples);
+  active_shared_memo->color_mask         = target.color_attachment_mask;
+  active_shared_memo->color_output_info_0= shared_color_output_info_0;
+  active_shared_memo->temporal_mode      = command.temporal_composite_mode;
+  active_shared_memo->split_postfx       = command.split_postfx_applied;
+  active_shared_memo->is_reflection      = target.is_reflection;
+  active_shared_memo->temporal_jitter    = target.temporal_jitter;
+  active_shared_memo->allocation         = shared_constants_allocation;
+  last_shared_draw_memo_                 = *active_shared_memo;
   }
 
   static const bool trace_glass_output = [] {
@@ -41140,7 +41165,7 @@ const bool keeps_draw_state =
                                !command.extras->tv_trace && !command.extras->temporal_instance)) &&
           !command.phone_trace && !command.temporal_scene_binding &&
           command.pipeline_state && command.shader_state &&
-          command.index_buffer && fire_query == UINT32_MAX) {
+          command.index_buffer && fire_query == UINT32_MAX) [[unlikely]] {
         DrawIndexedPrimitiveCommand head{};
         std::memcpy(&head, command.bytes.data(), sizeof(head));
         if (head.primitive_type == uint32_t(xenos::PrimitiveType::kTriangleList) &&
