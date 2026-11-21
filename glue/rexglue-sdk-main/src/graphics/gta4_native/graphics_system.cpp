@@ -328,6 +328,20 @@ REXCVAR_DEFINE_BOOL(gta4_native_fold_depth_clears, true, "GTA IV/Graphics/Native
 REXCVAR_DEFINE_BOOL(gta4_native_drop_inert_blending, true, "GTA IV/Graphics/Native Renderer",
                     "Disable blending on targets where it cannot change the result (no channel "
                     "written, or source*1 + destination*0), so Turnip keeps LRZ on");
+// 70: an attachment the scope LOADs and never writes keeps its memory as it was, so its GMEM
+// tiles need not be written back: VK_ATTACHMENT_STORE_OP_NONE (VK_KHR_dynamic_rendering /
+// Vulkan 1.3). Read-only depth scopes (lights, translucents, particles, post) are the bulk.
+// The choice is made when the scope opens from the commands already queued for it; a later
+// command that writes such an attachment first closes the scope and reopens it with STORE
+// (the reopened scope LOADs the unchanged memory), so a wrong guess costs one split, never
+// content.
+REXCVAR_DEFINE_BOOL(gta4_native_store_none_unwritten, true, "GTA IV/Graphics/Native Renderer",
+                    "Do not write back attachments a rendering scope loads and never writes "
+                    "(store op NONE); a write in the scope reopens it with STORE");
+REXCVAR_DEFINE_UINT32(gta4_native_store_none_lookahead, 256, "GTA IV/Graphics/Native Renderer",
+                      "Queued commands examined when a scope opens to predict its attachment "
+                      "writes for gta4_native_store_none_unwritten (0 = the opening command only)")
+    .range(0, 4096);
 REXCVAR_DEFINE_BOOL(gta4_native_resolve_kind_report, false, "GTA IV/Diagnostics",
                     "Count resolves and surface materializations by kind and log them with the "
                     "pipeline report");
@@ -920,6 +934,20 @@ std::atomic<uint64_t> g_lazy_resolves_skipped{0};
 std::array<std::atomic<uint64_t>, 4> g_materializations{};
 std::atomic<uint64_t> g_materializations_skipped{0};
 std::atomic<uint64_t> g_indexed_draws_merged{0};
+// 70: store op NONE on attachments a scope loads and never writes.
+std::atomic<uint64_t> g_store_none_attachments{0};  // attachments opened with NONE
+std::atomic<uint64_t> g_store_none_pixels{0};       // their pixels (write-back avoided)
+std::atomic<uint64_t> g_store_none_splits{0};       // scopes reopened because of a write
+std::atomic<uint64_t> g_store_none_suppressed{0};   // scopes kept on STORE after a recent split
+// Scope keys (targets + phase) that recently had to be reopened for a write: such a scope gets
+// STORE from its first command for kStoreNoneSplitMemoFrames frames. Per recording thread, so
+// no locking; a miss only costs a split again.
+struct StoreNoneSplitMemo {
+  uint64_t key = 0;
+  uint32_t frame = 0;
+};
+constexpr uint32_t kStoreNoneSplitMemoFrames = 300;
+thread_local std::array<StoreNoneSplitMemo, 512> t_store_none_split_memo{};
 std::atomic<uint64_t> g_draw_state_kept{0};
 std::atomic<uint64_t> g_resolve_swaps_planned{0}, g_resolve_swaps_fast{0};
 std::atomic<uint64_t> g_present_from_surface{0};
@@ -28478,30 +28506,42 @@ void Gta4NativeGraphicsSystem::ReportRenderingScopes() {
   // handoff (2), resolve clears, present, the frame's draws (2).
   const auto& s = c.by_site;
   const double lazy_skipped = per(g_lazy_resolves_skipped.exchange(0));
+  // 70: attachments begun with store op NONE, their pixels, and scopes reopened for a write.
+  const double store_none = per(g_store_none_attachments.exchange(0, std::memory_order_relaxed));
+  const double store_none_mpx =
+      per(g_store_none_pixels.exchange(0, std::memory_order_relaxed)) / 1e6;
+  const double store_none_splits =
+      per(g_store_none_splits.exchange(0, std::memory_order_relaxed));
+  const double store_none_suppressed =
+      per(g_store_none_suppressed.exchange(0, std::memory_order_relaxed));
   REXLOG_WARN(
       "gta4-native-scopes: {:.1f} s: frames={} per frame: scopes={:.1f} "
       "[alias={:.1f} resolve={:.1f} depth-resolve={:.1f}/{:.1f} materialize={:.1f} "
       "handoff={:.1f}/{:.1f} clears={:.1f} present={:.1f} draws={:.1f}/{:.1f}] "
       "color load/clear/dont-care={:.1f}/{:.1f}/{:.1f} depth load/clear/dont-care="
-      "{:.1f}/{:.1f}/{:.1f} stores={:.1f} Mpx loaded={:.2f} stored={:.2f} lazy-skipped={:.1f}",
+      "{:.1f}/{:.1f}/{:.1f} stores={:.1f} Mpx loaded={:.2f} stored={:.2f} lazy-skipped={:.1f} "
+      "store-none={:.1f} store-none-Mpx={:.2f} store-none-splits={:.1f} store-none-held={:.1f}",
       double(now - rendering_scope_report_tick_) / double(frequency), c.frames, per(c.scopes),
       per(s[0]), per(s[1]), per(s[2]), per(s[3]), per(s[4]), per(s[5]), per(s[6]), per(s[7]),
       per(s[8]), per(s[9]), per(s[10]), per(c.color_load), per(c.color_clear),
       per(c.color_dont_care), per(c.depth_load), per(c.depth_clear), per(c.depth_dont_care),
-      per(c.attachment_stores), per(c.load_pixels) / 1e6, per(c.store_pixels) / 1e6, lazy_skipped);
+      per(c.attachment_stores), per(c.load_pixels) / 1e6, per(c.store_pixels) / 1e6, lazy_skipped,
+      store_none, store_none_mpx, store_none_splits, store_none_suppressed);
 #if defined(__ANDROID__)
   __android_log_print(
       ANDROID_LOG_WARN, "LibertyRecomp",
       "gta4-native-scopes: %.1f s: frames=%llu per frame: scopes=%.1f "
       "[alias=%.1f resolve=%.1f depth-resolve=%.1f/%.1f materialize=%.1f handoff=%.1f/%.1f "
       "clears=%.1f present=%.1f draws=%.1f/%.1f] color load/clear/dont-care=%.1f/%.1f/%.1f "
-      "depth load/clear/dont-care=%.1f/%.1f/%.1f stores=%.1f Mpx loaded=%.2f stored=%.2f lazy-skipped=%.1f",
+      "depth load/clear/dont-care=%.1f/%.1f/%.1f stores=%.1f Mpx loaded=%.2f stored=%.2f lazy-skipped=%.1f "
+      "store-none=%.1f store-none-Mpx=%.2f store-none-splits=%.1f store-none-held=%.1f",
       double(now - rendering_scope_report_tick_) / double(frequency),
       static_cast<unsigned long long>(c.frames), per(c.scopes), per(s[0]), per(s[1]), per(s[2]),
       per(s[3]), per(s[4]), per(s[5]), per(s[6]), per(s[7]), per(s[8]), per(s[9]), per(s[10]),
       per(c.color_load), per(c.color_clear), per(c.color_dont_care), per(c.depth_load),
       per(c.depth_clear), per(c.depth_dont_care), per(c.attachment_stores),
-      per(c.load_pixels) / 1e6, per(c.store_pixels) / 1e6, lazy_skipped);
+      per(c.load_pixels) / 1e6, per(c.store_pixels) / 1e6, lazy_skipped, store_none,
+      store_none_mpx, store_none_splits, store_none_suppressed);
 #endif
   rendering_scope_report_tick_ = now;
   c = {};
@@ -34592,6 +34632,41 @@ NativeFrameTask Gta4NativeGraphicsSystem::RecordNativeFrameTask(
   NativeTextureImage* final_composite_input = nullptr;
   bool recorded_draw = false;
   bool rendering = false;
+  // 70: attachments of the open scope begun with store op NONE: bit i = color render target
+  // i, bit 8 = depth/stencil. Valid while `rendering`.
+  uint32_t scope_store_none_mask = 0;
+  uint64_t scope_store_none_key = 0;
+  constexpr uint32_t kStoreNoneDepthStencilBit = 1u << 8;
+  constexpr uint32_t kStoreNoneAllBits = ((1u << kRenderTargetCount) - 1u) | kStoreNoneDepthStencilBit;
+  // Attachments a command may write, in the same bits. A superset of what the pipeline or the
+  // clear really writes: the color mask before the shader-output/format reduction, depth
+  // writes without the depth-test condition, stencil whenever the test is on with a non-zero
+  // write mask on either face. Anything other than a draw or a clear: everything.
+  const auto command_attachment_writes = [&](const NativeCommand& c) -> uint32_t {
+    const bool draw = c.type == CommandType::kDrawPrimitive ||
+                      c.type == CommandType::kDrawPrimitiveUp ||
+                      c.type == CommandType::kDrawIndexedPrimitive;
+    if (draw) {
+      const NativeFixedFunctionState& f = *c.fixed_function_state;  // never null (default block)
+      uint32_t writes = 0;
+      for (uint32_t index = 0; index < kRenderTargetCount; ++index) {
+        if (NativeColorWriteMaskForTarget(f.color_write_mask, index) != 0) writes |= 1u << index;
+      }
+      if (f.depth_write_enable ||
+          (f.stencil_enable && ((f.stencil_write_mask | f.back_stencil_write_mask) & 0xFFu))) {
+        writes |= kStoreNoneDepthStencilBit;
+      }
+      return writes;
+    }
+    if (c.type == CommandType::kClear && c.bytes.size() >= sizeof(ClearCommand)) {
+      ClearCommand clear{};
+      std::memcpy(&clear, c.bytes.data(), sizeof(clear));
+      uint32_t writes = clear.flags & ((1u << kRenderTargetCount) - 1u);
+      if (clear.flags & 0x30u) writes |= kStoreNoneDepthStencilBit;
+      return writes;
+    }
+    return kStoreNoneAllBits;
+  };
   // A clear whose depth/stencil part became its scope's load-op clear.
   size_t folded_depth_clear_index = SIZE_MAX;
   uint32_t lighting_pass_reuses = 0;
@@ -39867,6 +39942,18 @@ const bool keeps_draw_state =
       if (rendering) { end_rendering(__LINE__); rendering = false; }
       if (!ResolveTemporalScene(command_buffer, command, target, resources)) co_return false;
     }
+    // 70: this command writes an attachment the open scope will not store: close the scope
+    // here (nothing was written to it, its memory is current) and reopen it below, where the
+    // new scope stores what this command writes.
+    if (rendering && scope_store_none_mask &&
+        (command_attachment_writes(command) & scope_store_none_mask)) {
+      end_rendering(__LINE__);
+      rendering = false;
+      scope_store_none_mask = 0;
+      t_store_none_split_memo[scope_store_none_key & (t_store_none_split_memo.size() - 1)] = {
+          scope_store_none_key, submitted_frame};
+      g_store_none_splits.fetch_add(1, std::memory_order_relaxed);
+    }
     if (!rendering || !targets_equal(active_target, target)) {
       if (rendering) {
         // TEMP: classify why consecutive draws split the rendering scope.
@@ -40211,6 +40298,126 @@ const bool keeps_draw_state =
         producer_depth_resolve = PrepareProducerDepthResolve(
             command_buffer, command_index, target, depth_attachment, stencil_attachment,
             producer_depth_resolve_scan);
+      }
+      // 70: attachments this scope LOADs and, as far as the queued commands show, never
+      // writes are begun with store op NONE. Same normal-play conditions as the producer depth
+      // resolve above (probes and diagnostic variants read or write attachments outside the
+      // title stream), no presenter, no attachment resolve.
+      scope_store_none_mask = 0;
+      // A producer depth resolve completes when the scope ends; a split would complete it
+      // before the producer's draws, so such scopes keep STORE everywhere.
+      if (REXCVAR_GET(gta4_native_store_none_unwritten) && !target.uses_presenter &&
+          !producer_depth_resolve.attached &&
+          !diagnostic_frame && !fire_images_ && !force_content_probe &&
+          !diagnostic_variants_enabled && !phone_trace_readbacks_frame &&
+          !selected_light_stencil_setup_draw && !light_color_delta_draw &&
+          !postfx_scheduler.scene_capture_pending() && !legacy_ps9_bypass_frame &&
+          ps9_stencil_probe_original_frame && stencil_face_probe_original_frame &&
+          !native_probes_diag_frame && !fire_checkpoint && !bulb_original_probe &&
+          !bulb_interference_probe && !phone_probe_selected && !tv_probe_selected &&
+          !REXCVAR_GET(gta4_native_light_stencil_baseline)) {
+        uint32_t candidates = 0;
+        for (uint32_t index = 0; index < kRenderTargetCount; ++index) {
+          const VkRenderingAttachmentInfo& attachment = color_attachments[index];
+          if (attachment.imageView && attachment.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD &&
+              attachment.storeOp == VK_ATTACHMENT_STORE_OP_STORE &&
+              attachment.resolveMode == VK_RESOLVE_MODE_NONE &&
+              attachment.resolveImageView == VK_NULL_HANDLE) {
+            candidates |= 1u << index;
+          }
+        }
+        const bool has_stencil_attachment =
+            target.depth_stencil_attachment_active && target.depth_surface &&
+            (target.depth_surface->aspect & VK_IMAGE_ASPECT_STENCIL_BIT);
+        if (target.depth_stencil_attachment_active && target.depth_surface &&
+            depth_attachment.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD &&
+            depth_attachment.storeOp == VK_ATTACHMENT_STORE_OP_STORE &&
+            depth_attachment.resolveMode == VK_RESOLVE_MODE_NONE &&
+            depth_attachment.resolveImageView == VK_NULL_HANDLE &&
+            (!has_stencil_attachment ||
+             (stencil_attachment.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD &&
+              stencil_attachment.storeOp == VK_ATTACHMENT_STORE_OP_STORE &&
+              stencil_attachment.resolveMode == VK_RESOLVE_MODE_NONE &&
+              stencil_attachment.resolveImageView == VK_NULL_HANDLE))) {
+          candidates |= kStoreNoneDepthStencilBit;
+        }
+        uint32_t predicted_writes = candidates ? command_attachment_writes(command) : 0;
+        if (candidates & ~predicted_writes) {
+          // The commands queued behind this one that would stay in this scope: draws and
+          // clears with the same render target and depth descriptors. Stop at anything else.
+          const uint32_t lookahead = REXCVAR_GET(gta4_native_store_none_lookahead);
+          const NativeCommand* opener = &command;
+          for (size_t next = command_index + 1, scanned = 0;
+               next < (*recording_frame_).size() && scanned < lookahead &&
+               (candidates & ~predicted_writes);
+               ++next, ++scanned) {
+            const NativeCommand& other = (*recording_frame_)[next];
+            const bool other_draw = other.type == CommandType::kDrawPrimitive ||
+                                    other.type == CommandType::kDrawPrimitiveUp ||
+                                    other.type == CommandType::kDrawIndexedPrimitive;
+            if (other.type == CommandType::kRenderPhaseMarker ||
+                other.type == CommandType::kSetRenderState) {
+              continue;
+            }
+            if ((!other_draw && other.type != CommandType::kClear) || !other.pipeline_state ||
+                !opener->pipeline_state ||
+                std::memcmp(&other.pipeline_state->render_targets,
+                            &opener->pipeline_state->render_targets,
+                            sizeof(opener->pipeline_state->render_targets)) != 0 ||
+                std::memcmp(&other.pipeline_state->depth_stencil,
+                            &opener->pipeline_state->depth_stencil,
+                            sizeof(opener->pipeline_state->depth_stencil)) != 0) {
+              break;
+            }
+            predicted_writes |= command_attachment_writes(other);
+          }
+        }
+        scope_store_none_mask = candidates & ~predicted_writes;
+        if (scope_store_none_mask && command.pipeline_state) {
+          // Same scope (targets and phase) reopened for a write in a recent frame: STORE.
+          std::array<uint8_t, sizeof(command.pipeline_state->render_targets) +
+                                  sizeof(command.pipeline_state->depth_stencil) +
+                                  sizeof(command.render_phase)>
+              key_bytes;
+          std::memcpy(key_bytes.data(), &command.pipeline_state->render_targets,
+                      sizeof(command.pipeline_state->render_targets));
+          std::memcpy(key_bytes.data() + sizeof(command.pipeline_state->render_targets),
+                      &command.pipeline_state->depth_stencil,
+                      sizeof(command.pipeline_state->depth_stencil));
+          std::memcpy(key_bytes.data() + sizeof(command.pipeline_state->render_targets) +
+                          sizeof(command.pipeline_state->depth_stencil),
+                      &command.render_phase, sizeof(command.render_phase));
+          scope_store_none_key = XXH3_64bits(key_bytes.data(), key_bytes.size());
+          const StoreNoneSplitMemo& memo =
+              t_store_none_split_memo[scope_store_none_key & (t_store_none_split_memo.size() - 1)];
+          if (memo.key == scope_store_none_key &&
+              submitted_frame - memo.frame < kStoreNoneSplitMemoFrames) {
+            scope_store_none_mask = 0;
+            g_store_none_suppressed.fetch_add(1, std::memory_order_relaxed);
+          }
+        } else {
+          scope_store_none_mask = 0;
+        }
+        if (scope_store_none_mask) {
+          uint64_t pixels = 0;
+          uint32_t attachments = 0;
+          const uint64_t area = uint64_t(target.width) * target.height;
+          for (uint32_t index = 0; index < kRenderTargetCount; ++index) {
+            if (scope_store_none_mask & (1u << index)) {
+              color_attachments[index].storeOp = VK_ATTACHMENT_STORE_OP_NONE_KHR;
+              pixels += area;
+              ++attachments;
+            }
+          }
+          if (scope_store_none_mask & kStoreNoneDepthStencilBit) {
+            depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_NONE_KHR;
+            stencil_attachment.storeOp = VK_ATTACHMENT_STORE_OP_NONE_KHR;
+            pixels += area;
+            ++attachments;
+          }
+          g_store_none_attachments.fetch_add(attachments, std::memory_order_relaxed);
+          g_store_none_pixels.fetch_add(pixels, std::memory_order_relaxed);
+        }
       }
 // TEMP: load ops of rendering scopes, split by colorless (light setup) scopes.
       if ((native_trace_diag_frame || diagnostic_frame) && target.depth_stencil_attachment_active) {
