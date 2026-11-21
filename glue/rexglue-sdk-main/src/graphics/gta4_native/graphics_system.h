@@ -2716,6 +2716,29 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
       const bool& hdr_output, const float& hdr_headroom, bool& presenter_transfer_written,
       bool& presenter_written, const bool& trace_stages, const uint32_t& trace_sequence,
       const bool& force_content_probe, bool streaming);
+  [[gnu::noinline]] const NativeCommand* ApplyColdDrawOverrides(
+      const NativeCommand& queued_command, uint32_t submitted_frame, size_t command_index,
+      bool legacy_ps9_bypass_frame, bool ps9_stencil_probe_original_frame,
+      const std::string& ps9_stencil_probe_frame, bool stencil_face_probe_original_frame,
+      const std::string& stencil_face_probe_frame,
+      std::unique_ptr<NativeCommand>& scratch_override);
+  [[gnu::noinline]] bool RecordIndexedDrawFailure(
+      const NativeCommand& command, const NativeRenderingTarget& target,
+      const char* reason) const;
+  [[gnu::noinline]] void LogIndexedDrawDiagnostics(
+      const NativeCommand& command, const DrawIndexedPrimitiveCommand& draw,
+      uint32_t required_streams_mask, const uint8_t* selected_index_bytes,
+      uint32_t host_start_index, uint32_t host_index_count, bool index32,
+      bool guest_restart_enabled, VkPrimitiveTopology topology) const;
+  [[gnu::noinline]] void LogHoveGantryIndexedDraw(
+      const NativeCommand& command, const DrawIndexedPrimitiveCommand& draw,
+      const NativeRenderingTarget& target, VkPrimitiveTopology topology, bool index32,
+      VkIndexType bound_index_type, bool guest_restart_enabled, bool moltenvk_strip_restart,
+      uint32_t host_start_index, uint32_t host_index_count) const;
+  [[gnu::noinline]] void ValidateIndexedDrawBoundsForBreadcrumbs(
+      const NativeCommand& command, const DrawIndexedPrimitiveCommand& draw,
+      uint32_t required_streams_mask, const uint8_t* selected_index_bytes,
+      uint32_t host_index_count, bool index32, bool guest_restart_enabled) const;
   bool RecordPrimitive(VkCommandBuffer command_buffer, const NativeCommand& command, uint32_t width,
                        uint32_t height, const NativeRenderingTarget& target,
                        NativeFrameResources& resources);
@@ -4017,8 +4040,16 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     bool dedupe_index_binding = true;
     bool vertex_cache_order = true;
     bool gpu_breadcrumbs = false;
+    bool early_fragment_tests = false;
+    bool colorless_fragment = false;
+    bool empty_fragment = false;
+    bool artificial_light_trace_frame = false;
+    bool collect_indexed_diagnostics = false;
+    bool trace_hove_gantry = false;
   };
   RecorderFrameCvarCache frame_cvar_cache_{};
+  uint64_t recording_submission_ = 0;
+  bool recording_flight_enabled_ = false;
   void RefreshRecorderFrameCvars();
   NativeDescriptorSlotHandle native_null_image_descriptor_{};
   NativeDescriptorSlotHandle native_null_sampler_descriptor_{};
@@ -4145,7 +4176,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     bool temporal_jitter = false;
     NativeUploadAllocation allocation{};
   };
-  FastSharedConstMemo last_shared_draw_memo_{};
+  uint32_t last_shared_memo_slot_ = UINT32_MAX;
   std::array<FastSharedConstMemo, 1024> fast_shared_memo_cache_{};
   uint32_t ubo_rewritten_shaders_ = 0;
   uint64_t ubo_rewritten_loads_ = 0;
