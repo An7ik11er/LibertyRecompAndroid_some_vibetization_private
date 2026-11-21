@@ -342,6 +342,8 @@ REXCVAR_DEFINE_UINT32(gta4_native_store_none_lookahead, 256, "GTA IV/Graphics/Na
                       "Queued commands examined when a scope opens to predict its attachment "
                       "writes for gta4_native_store_none_unwritten (0 = the opening command only)")
     .range(0, 4096);
+REXCVAR_DEFINE_BOOL(gta4_native_store_dont_care_dead, true, "GTA IV/Graphics/Native Renderer",
+                    "Set store op DONT_CARE on attachments that are dead after the scope");
 REXCVAR_DEFINE_BOOL(gta4_native_resolve_kind_report, false, "GTA IV/Diagnostics",
                     "Count resolves and surface materializations by kind and log them with the "
                     "pipeline report");
@@ -939,6 +941,8 @@ std::atomic<uint64_t> g_store_none_attachments{0};  // attachments opened with N
 std::atomic<uint64_t> g_store_none_pixels{0};       // their pixels (write-back avoided)
 std::atomic<uint64_t> g_store_none_splits{0};       // scopes reopened because of a write
 std::atomic<uint64_t> g_store_none_suppressed{0};   // scopes kept on STORE after a recent split
+std::atomic<uint64_t> g_store_dont_care_attachments{0};  // attachments closed with DONT_CARE
+std::atomic<uint64_t> g_store_dont_care_pixels{0};       // their pixels (write-back avoided)
 // Scope keys (targets + phase) that recently had to be reopened for a write: such a scope gets
 // STORE from its first command for kStoreNoneSplitMemoFrames frames. Per recording thread, so
 // no locking; a miss only costs a split again.
@@ -28514,19 +28518,25 @@ void Gta4NativeGraphicsSystem::ReportRenderingScopes() {
       per(g_store_none_splits.exchange(0, std::memory_order_relaxed));
   const double store_none_suppressed =
       per(g_store_none_suppressed.exchange(0, std::memory_order_relaxed));
+  const double store_dont_care =
+      per(g_store_dont_care_attachments.exchange(0, std::memory_order_relaxed));
+  const double store_dont_care_mpx =
+      per(g_store_dont_care_pixels.exchange(0, std::memory_order_relaxed)) / 1e6;
   REXLOG_WARN(
       "gta4-native-scopes: {:.1f} s: frames={} per frame: scopes={:.1f} "
       "[alias={:.1f} resolve={:.1f} depth-resolve={:.1f}/{:.1f} materialize={:.1f} "
       "handoff={:.1f}/{:.1f} clears={:.1f} present={:.1f} draws={:.1f}/{:.1f}] "
       "color load/clear/dont-care={:.1f}/{:.1f}/{:.1f} depth load/clear/dont-care="
       "{:.1f}/{:.1f}/{:.1f} stores={:.1f} Mpx loaded={:.2f} stored={:.2f} lazy-skipped={:.1f} "
-      "store-none={:.1f} store-none-Mpx={:.2f} store-none-splits={:.1f} store-none-held={:.1f}",
+      "store-none={:.1f} store-none-Mpx={:.2f} store-none-splits={:.1f} store-none-held={:.1f} "
+      "store-dont-care={:.1f} store-dont-care-Mpx={:.2f}",
       double(now - rendering_scope_report_tick_) / double(frequency), c.frames, per(c.scopes),
       per(s[0]), per(s[1]), per(s[2]), per(s[3]), per(s[4]), per(s[5]), per(s[6]), per(s[7]),
       per(s[8]), per(s[9]), per(s[10]), per(c.color_load), per(c.color_clear),
       per(c.color_dont_care), per(c.depth_load), per(c.depth_clear), per(c.depth_dont_care),
       per(c.attachment_stores), per(c.load_pixels) / 1e6, per(c.store_pixels) / 1e6, lazy_skipped,
-      store_none, store_none_mpx, store_none_splits, store_none_suppressed);
+      store_none, store_none_mpx, store_none_splits, store_none_suppressed,
+      store_dont_care, store_dont_care_mpx);
 #if defined(__ANDROID__)
   __android_log_print(
       ANDROID_LOG_WARN, "LibertyRecomp",
@@ -28534,14 +28544,16 @@ void Gta4NativeGraphicsSystem::ReportRenderingScopes() {
       "[alias=%.1f resolve=%.1f depth-resolve=%.1f/%.1f materialize=%.1f handoff=%.1f/%.1f "
       "clears=%.1f present=%.1f draws=%.1f/%.1f] color load/clear/dont-care=%.1f/%.1f/%.1f "
       "depth load/clear/dont-care=%.1f/%.1f/%.1f stores=%.1f Mpx loaded=%.2f stored=%.2f lazy-skipped=%.1f "
-      "store-none=%.1f store-none-Mpx=%.2f store-none-splits=%.1f store-none-held=%.1f",
+      "store-none=%.1f store-none-Mpx=%.2f store-none-splits=%.1f store-none-held=%.1f "
+      "store-dont-care=%.1f store-dont-care-Mpx=%.2f",
       double(now - rendering_scope_report_tick_) / double(frequency),
       static_cast<unsigned long long>(c.frames), per(c.scopes), per(s[0]), per(s[1]), per(s[2]),
       per(s[3]), per(s[4]), per(s[5]), per(s[6]), per(s[7]), per(s[8]), per(s[9]), per(s[10]),
       per(c.color_load), per(c.color_clear), per(c.color_dont_care), per(c.depth_load),
       per(c.depth_clear), per(c.depth_dont_care), per(c.attachment_stores),
       per(c.load_pixels) / 1e6, per(c.store_pixels) / 1e6, lazy_skipped, store_none,
-      store_none_mpx, store_none_splits, store_none_suppressed);
+      store_none_mpx, store_none_splits, store_none_suppressed,
+      store_dont_care, store_dont_care_mpx);
 #endif
   rendering_scope_report_tick_ = now;
   c = {};
@@ -40417,6 +40429,214 @@ const bool keeps_draw_state =
           }
           g_store_none_attachments.fetch_add(attachments, std::memory_order_relaxed);
           g_store_none_pixels.fetch_add(pixels, std::memory_order_relaxed);
+        }
+      }
+      // Dead attachment optimization: attachments written (or loaded) in this scope that are
+      // never read, resolved, sampled, or presented for the rest of the frame (and whose next use,
+      // if any, begins with a full clear) are closed with store op DONT_CARE.
+      if (REXCVAR_GET(gta4_native_store_dont_care_dead) && !target.uses_presenter &&
+          !producer_depth_resolve.attached &&
+          !diagnostic_frame && !fire_images_ && !force_content_probe &&
+          !diagnostic_variants_enabled && !phone_trace_readbacks_frame &&
+          !selected_light_stencil_setup_draw && !light_color_delta_draw &&
+          !postfx_scheduler.scene_capture_pending() && !legacy_ps9_bypass_frame &&
+          ps9_stencil_probe_original_frame && stencil_face_probe_original_frame &&
+          !native_probes_diag_frame && !fire_checkpoint && !bulb_original_probe &&
+          !bulb_interference_probe && !phone_probe_selected && !tv_probe_selected &&
+          !REXCVAR_GET(gta4_native_light_stencil_baseline)) {
+        size_t future_start = command_index + 1;
+        const NativeCommand* opener = &command;
+        while (future_start < (*recording_frame_).size()) {
+          const NativeCommand& other = (*recording_frame_)[future_start];
+          const bool other_draw = other.type == CommandType::kDrawPrimitive ||
+                                  other.type == CommandType::kDrawPrimitiveUp ||
+                                  other.type == CommandType::kDrawIndexedPrimitive;
+          if (other.type == CommandType::kRenderPhaseMarker ||
+              other.type == CommandType::kSetRenderState) {
+            ++future_start;
+            continue;
+          }
+          if ((!other_draw && other.type != CommandType::kClear) || !other.pipeline_state ||
+              !opener->pipeline_state ||
+              std::memcmp(&other.pipeline_state->render_targets,
+                          &opener->pipeline_state->render_targets,
+                          sizeof(other.pipeline_state->render_targets)) != 0 ||
+              std::memcmp(&other.pipeline_state->depth_stencil,
+                          &opener->pipeline_state->depth_stencil,
+                          sizeof(other.pipeline_state->depth_stencil)) != 0) {
+            break;
+          }
+          ++future_start;
+        }
+
+        uint32_t dont_care_attachments = 0;
+        uint64_t dont_care_pixels = 0;
+        const uint64_t area = uint64_t(target.width) * target.height;
+
+        // 1. Depth and Stencil Attachment:
+        if (target.depth_stencil_attachment_active && target.depth_surface &&
+            !target.depth_surface->is_reflection &&
+            depth_attachment.storeOp == VK_ATTACHMENT_STORE_OP_STORE) {
+          const SurfaceDescriptor& depth_desc = target.depth_surface->descriptor;
+          const uint32_t depth_handle = depth_desc.handle;
+          const uint32_t depth_address = depth_desc.address;
+          bool depth_read = false;
+
+          for (size_t next = future_start; next < (*recording_frame_).size(); ++next) {
+            const NativeCommand& future_cmd = (*recording_frame_)[next];
+
+            if (future_cmd.pipeline_state &&
+                (future_cmd.pipeline_state->depth_stencil.handle == depth_handle ||
+                 future_cmd.pipeline_state->depth_stencil.address == depth_address)) {
+              if (future_cmd.type == CommandType::kClear &&
+                  future_cmd.bytes.size() >= sizeof(ClearCommand)) {
+                ClearCommand clear{};
+                std::memcpy(&clear, future_cmd.bytes.data(), sizeof(clear));
+                const bool clears_depth = (clear.flags & 0x10) != 0;
+                const bool full = clear.left <= 0 && clear.top <= 0 &&
+                                  clear.right >= int32_t(target.logical_width) &&
+                                  clear.bottom >= int32_t(target.logical_height);
+                if (clears_depth && full) {
+                  break;
+                }
+              }
+              const bool is_draw = future_cmd.type == CommandType::kDrawPrimitive ||
+                                   future_cmd.type == CommandType::kDrawPrimitiveUp ||
+                                   future_cmd.type == CommandType::kDrawIndexedPrimitive;
+              if (is_draw) {
+                depth_read = true;
+                break;
+              }
+            }
+
+            if (future_cmd.type == CommandType::kResolve &&
+                future_cmd.bytes.size() >= sizeof(ResolveCommand)) {
+              ResolveCommand resolve{};
+              std::memcpy(&resolve, future_cmd.bytes.data(), sizeof(resolve));
+              if (resolve.source.handle == depth_handle ||
+                  resolve.source.address == depth_address) {
+                depth_read = true;
+                break;
+              }
+            }
+
+            if (future_cmd.used_texture_mask) {
+              for (uint32_t mask = future_cmd.used_texture_mask; mask; mask &= mask - 1) {
+                const uint32_t stage = uint32_t(std::countr_zero(mask));
+                if (stage < future_cmd.textures.size() && future_cmd.textures[stage]) {
+                  const auto& tex = future_cmd.textures[stage];
+                  if (tex->handle == depth_handle ||
+                      tex->info.memory.base_address == depth_address ||
+                      tex->packed_depth_source != nullptr) {
+                    depth_read = true;
+                    break;
+                  }
+                }
+              }
+              if (depth_read) break;
+            }
+          }
+
+          if (!depth_read) {
+            depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            stencil_attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            ++dont_care_attachments;
+            dont_care_pixels += area;
+          }
+        }
+
+        // 2. Color Attachments (Safe within-frame: dead before a full clear):
+        if (!target.temporal_motion && !target.temporal_reactive && !target.temporal_jitter) {
+          for (uint32_t index = 0; index < kRenderTargetCount; ++index) {
+            VkRenderingAttachmentInfo& color_att = color_attachments[index];
+            if (!color_att.imageView || color_att.storeOp != VK_ATTACHMENT_STORE_OP_STORE ||
+                !target.color_surfaces[index] || target.color_surfaces[index]->is_reflection) {
+              continue;
+            }
+            const NativeSurfaceImage* color_surface = target.color_surfaces[index];
+            const SurfaceDescriptor& color_desc = color_surface->descriptor;
+            const uint32_t color_handle = color_desc.handle;
+            const uint32_t color_address = color_desc.address;
+
+            bool color_cleared_before_read = false;
+            bool color_read = false;
+
+            for (size_t next = future_start; next < (*recording_frame_).size(); ++next) {
+              const NativeCommand& future_cmd = (*recording_frame_)[next];
+
+              if (future_cmd.pipeline_state) {
+                for (uint32_t slot = 0; slot < kRenderTargetCount; ++slot) {
+                  const SurfaceDescriptor& slot_desc = future_cmd.pipeline_state->render_targets[slot];
+                  if (slot_desc.handle == color_handle || slot_desc.address == color_address) {
+                    if (future_cmd.type == CommandType::kClear &&
+                        future_cmd.bytes.size() >= sizeof(ClearCommand)) {
+                      ClearCommand clear{};
+                      std::memcpy(&clear, future_cmd.bytes.data(), sizeof(clear));
+                      const bool clears_color = (clear.flags & (1u << slot)) != 0;
+                      const bool full = clear.left <= 0 && clear.top <= 0 &&
+                                        clear.right >= int32_t(target.logical_width) &&
+                                        clear.bottom >= int32_t(target.logical_height);
+                      if (clears_color && full) {
+                        color_cleared_before_read = true;
+                        goto color_check_done;
+                      }
+                    }
+                    const bool is_draw = future_cmd.type == CommandType::kDrawPrimitive ||
+                                         future_cmd.type == CommandType::kDrawPrimitiveUp ||
+                                         future_cmd.type == CommandType::kDrawIndexedPrimitive;
+                    if (is_draw) {
+                      color_read = true;
+                      goto color_check_done;
+                    }
+                  }
+                }
+              }
+
+              if (future_cmd.type == CommandType::kResolve &&
+                  future_cmd.bytes.size() >= sizeof(ResolveCommand)) {
+                ResolveCommand resolve{};
+                std::memcpy(&resolve, future_cmd.bytes.data(), sizeof(resolve));
+                if (resolve.source.handle == color_handle ||
+                    resolve.source.address == color_address) {
+                  color_read = true;
+                  goto color_check_done;
+                }
+              }
+
+              if (future_cmd.used_texture_mask) {
+                for (uint32_t mask = future_cmd.used_texture_mask; mask; mask &= mask - 1) {
+                  const uint32_t stage = uint32_t(std::countr_zero(mask));
+                  if (stage < future_cmd.textures.size() && future_cmd.textures[stage]) {
+                    const auto& tex = future_cmd.textures[stage];
+                    if (tex->handle == color_handle ||
+                        tex->info.memory.base_address == color_address) {
+                      color_read = true;
+                      goto color_check_done;
+                    }
+                  }
+                }
+                if (color_read) goto color_check_done;
+              }
+
+              if (present_source && (present_source->handle == color_handle ||
+                                     present_source->info.memory.base_address == color_address)) {
+                color_read = true;
+                goto color_check_done;
+              }
+            }
+
+color_check_done:
+            if (color_cleared_before_read && !color_read) {
+              color_att.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+              ++dont_care_attachments;
+              dont_care_pixels += area;
+            }
+          }
+        }
+
+        if (dont_care_attachments) {
+          g_store_dont_care_attachments.fetch_add(dont_care_attachments, std::memory_order_relaxed);
+          g_store_dont_care_pixels.fetch_add(dont_care_pixels, std::memory_order_relaxed);
         }
       }
 // TEMP: load ops of rendering scopes, split by colorless (light setup) scopes.
