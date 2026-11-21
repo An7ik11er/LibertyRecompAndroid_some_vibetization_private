@@ -4795,8 +4795,7 @@ inline bool IsPlausibleGuestPtr(uint32_t ea) {
   if (ea < 0x00100000u || ea >= 0xF0000000u) {
     return false;
   }
-  const uint32_t hi = ea & 0xFFFF0000u;
-  return hi != 0xCDCD0000u && hi != 0xDDDD0000u && hi != 0xFEEE0000u;
+  return ea != 0xCDCDCDCDu && ea != 0xDDDDDDDDu && ea != 0xFEEEFEEEu;
 }
 
 }  // namespace

@@ -370,8 +370,10 @@ extern "C" void FastSub828C6620(PPCContext& ctx, uint8_t* base) {
 
       REX_STORE_U32(kGlobalBase + 15836u, cur_pass);
 
-      if (FireTraceConfig().enabled) [[unlikely]] {
-        // Fallback to original slow path for tracing
+      const bool use_fallback = FireTraceConfig().enabled || !IsNativeMode();
+
+      if (use_fallback) [[unlikely]] {
+        // Fallback slow path for tracing or non-native mode
         ctx.r10.u64 = pass_base;
         ctx.r11.u64 = shader_data;
         ctx.r6.u64 = r27_shader_plus_20;
@@ -382,14 +384,15 @@ extern "C" void FastSub828C6620(PPCContext& ctx, uint8_t* base) {
         ctx.lr = 0x828C6690u;
         sub_828C8F38(ctx, base);
       } else {
-        // Fast path: Inlined FastSub828C8F38
-        if (!IsPlausibleGuestPtr(cur_pass)) {
+        // Fast path: Single-pass RAGE DrawPass (states + shaders + textures + constants coalesced)
+        if (!IsPlausibleGuestPtr(cur_pass)) [[unlikely]] {
           if (s_pass_diag_count.fetch_add(1, std::memory_order_relaxed) < 16u) {
             REXLOG_WARN("diag-828C8F38: bad-pass pass={:08X} tech={:08X} g82CBBE18={:08X}",
                         cur_pass, LoadU32(base, 0x831C3DE0u),
                         LoadU32(base, 0x82CBBE18u));
           }
         } else {
+          // 1. Process render states (typically 0 or 1-2 pairs)
           const uint16_t state_count = REX_LOAD_U16(cur_pass + 28u);
           if (state_count > 0u) {
             const uint32_t states = REX_LOAD_U32(cur_pass + 24u);
@@ -403,69 +406,215 @@ extern "C" void FastSub828C6620(PPCContext& ctx, uint8_t* base) {
               for (uint16_t i = 0; i < state_count; ++i) {
                 const uint32_t state_id = REX_LOAD_U32(states + state_off);
                 const uint32_t state_val = REX_LOAD_U32(states + state_off + 4u);
-                uint32_t offset = 0xFFFFFFFFu;
-                uint32_t target = 0u;
                 if (state_id < 512u && IsPlausibleGuestPtr(grc_dev)) {
-                  offset = LoadU32(base, 0x82B0D8F8u + (state_id << 2));
+                  const uint32_t offset = LoadU32(base, 0x82B0D8F8u + (state_id << 2));
                   if (offset < 0x10000u) {
-                    target = LoadU32(base, grc_dev + offset + 64u);
+                    const uint32_t target = LoadU32(base, grc_dev + offset + 64u);
+                    if (IsPlausibleGuestPtr(target)) {
+                      ctx.r3.u64 = state_id;
+                      ctx.r4.u64 = state_val;
+                      ctx.lr = 0x828C8F7Cu;
+                      sub_828E02E8(ctx, base);
+                    }
                   }
-                }
-                if (!IsPlausibleGuestPtr(target)) {
-                  if (s_pass_diag_count.fetch_add(1, std::memory_order_relaxed) < 16u) {
-                    REXLOG_WARN(
-                        "diag-828E02E8: bad-target pass={:08X} i={}/{} id={} val={:08X} grc={:08X} off={:08X} "
-                        "target={:08X} tech={:08X} g82CBBE18={:08X}",
-                        cur_pass, i, state_count, state_id, state_val, grc_dev, offset, target,
-                        LoadU32(base, 0x831C3DE0u), LoadU32(base, 0x82CBBE18u));
-                  }
-                } else {
-                  ctx.r3.u64 = state_id;
-                  ctx.r4.u64 = state_val;
-                  ctx.lr = 0x828C8F7Cu;
-                  sub_828E02E8(ctx, base);
                 }
                 state_off += 8u;
               }
             }
           }
 
+          // 2. Single-pass Shader Binding + Textures (is_const == 0) + Constants (is_const != 0)
+          const uint32_t type_table = IsPlausibleGuestPtr(r27_shader_plus_20) ? REX_LOAD_U32(r27_shader_plus_20 + 16u) : 0u;
+          const uint32_t val_table  = IsPlausibleGuestPtr(r27_shader_plus_20) ? REX_LOAD_U32(r27_shader_plus_20 + 0u) : 0u;
+          const uint32_t effect_base = IsPlausibleGuestPtr(shader_data) ? REX_LOAD_U32(shader_data_8 + 0u) : 0u;
+          const bool tables_ok = IsPlausibleGuestPtr(type_table) && IsPlausibleGuestPtr(val_table);
+          const bool effect_ok = IsPlausibleGuestPtr(effect_base);
+          uint8_t* const device_memory = base + grc_dev;
+          uint64_t vs_dirty_mask = 0ULL;
+          uint64_t ps_dirty_mask = 0ULL;
+          uint64_t int_bool_dirty_mask = 0ULL;
+
           const uint32_t vs_idx = REX_LOAD_U32(cur_pass);
           if (vs_idx < 1024u && IsPlausibleGuestPtr(vs_base)) {
-            ctx.r3.u64 = cur_pass;
-            ctx.r4.u64 = vs_base + (((vs_idx * 3u) << 2) & 0xFFFFFFFCu);
-            ctx.r5.u64 = r27_shader_plus_20;
-            ctx.r6.u64 = shader_data_8;
-            ctx.lr = 0x828C8FB4u;
-            sub_828C8DB0(ctx, base);
-          } else if (s_pass_diag_count.fetch_add(1, std::memory_order_relaxed) < 16u) {
-            REXLOG_WARN("diag-828C8F38: bad-vs pass={:08X} vs_idx={} vs_tab={:08X} vs_base={:08X}",
-                        cur_pass, vs_idx, r26_vs_table, vs_base);
+            const uint32_t arg1 = vs_base + (((vs_idx * 3u) << 2) & 0xFFFFFFFCu);
+            if (IsPlausibleGuestPtr(arg1)) {
+              constexpr uint32_t kBoundVertexShaderGlobal = 0x831C5DD8u;
+              const uint32_t vs = LoadU32(base, arg1 + 8u);
+              if (LoadU32(base, kBoundVertexShaderGlobal) != vs) {
+                StoreU32(base, kBoundVertexShaderGlobal, vs);
+                ctx.r3.u64 = grc_dev;
+                ctx.r4.u64 = vs;
+                ctx.lr = 0x828C8DD4u;
+                sub_82A42760(ctx, base);
+              }
+              const uint16_t vs_param_count = REX_LOAD_U16(cur_pass + 8u);
+              if (tables_ok && vs_param_count > 0u && vs_param_count <= 256u) {
+                const uint32_t vs_pair_table = REX_LOAD_U32(cur_pass + 4u);
+                const uint32_t arg1_table = REX_LOAD_U32(arg1 + 4u);
+                if (IsPlausibleGuestPtr(vs_pair_table) && IsPlausibleGuestPtr(arg1_table)) {
+                  for (uint16_t i = 0; i < vs_param_count; ++i) {
+                    const uint16_t pair = REX_LOAD_U16(vs_pair_table + (static_cast<uint32_t>(i) << 1));
+                    const uint32_t idx0 = static_cast<uint32_t>(pair >> 8);
+                    const uint32_t param_idx = static_cast<uint32_t>(pair & 0xFFu);
+                    const uint8_t is_const = LoadU8(base, type_table + idx0);
+                    const uint32_t val = LoadU32(base, val_table + (idx0 << 2));
+                    const uint32_t param_entry = arg1_table + (param_idx << 3);
+                    if (is_const == 0u) {
+                      if (effect_ok) [[likely]] {
+                        const uint32_t stage = 16u + LoadU16(base, param_entry + 2u);
+                        const uint32_t desc = effect_base + (idx0 * 48u);
+                        const int32_t override_count =
+                            static_cast<int32_t>((static_cast<uint32_t>(LoadU8(base, desc + 2u)) >> 1) & 0x7FFFFFFFu);
+                        const uint32_t overrides = LoadU32(base, desc + 24u);
+                        ctx.lr = 0x828C8E3Cu;
+                        BindRAGEEffectTextureStage(ctx, base, stage, val, override_count, overrides);
+                      }
+                    } else if (val >= 0x00010000u && val < 0xF0000000u) [[likely]] {
+                      const uint32_t param_type = LoadU8(base, param_entry);
+                      const uint32_t reg_idx = LoadU16(base, param_entry + 2u);
+                      if (param_type == 1u) [[unlikely]] {
+                        const uint32_t packed = (uint32_t(LoadU8(base, val + 11u)) << 16) |
+                                                (uint32_t(LoadU8(base, val + 7u)) << 8) |
+                                                uint32_t(LoadU8(base, val + 3u));
+                        StoreU32(base, grc_dev + 10144u + (reg_idx << 2), packed);
+                        int_bool_dirty_mask |= (1ULL << 56);
+                      } else if (param_type == 7u) [[unlikely]] {
+                        const uint32_t bit_val = LoadU32(base, val) & 1u;
+                        const uint32_t bit = reg_idx & 0x1Fu;
+                        const uint32_t offset = (2528u + (reg_idx >> 5)) << 2;
+                        const uint32_t current = LoadU32(base, grc_dev + offset);
+                        const uint32_t mask = 1u << bit;
+                        StoreU32(base, grc_dev + offset, (current & ~mask) | (bit_val << bit));
+                        int_bool_dirty_mask |= (1ULL << 56);
+                      } else [[likely]] {
+                        const uint32_t stride = LoadU8(base, 0x82B0D32Cu + param_type);
+                        const uint32_t reg_count = stride * static_cast<uint32_t>(is_const);
+                        if (reg_count > 0u && (reg_idx + reg_count) <= 256u) [[likely]] {
+                          std::memcpy(device_memory + 1920u + (reg_idx << 4), base + val,
+                                      static_cast<size_t>(reg_count) << 4);
+                          const uint32_t start_word = reg_idx >> 2;
+                          const uint32_t end_block = (reg_idx + reg_count - 1u) >> 2;
+                          const uint32_t shift = std::min<uint32_t>(end_block - start_word, 63u);
+                          const uint64_t mask_raw =
+                              static_cast<uint64_t>(static_cast<int64_t>(0x8000000000000000ULL) >> shift);
+                          const uint64_t dirty_mask = (start_word & 0x40u) ? 0ULL : (mask_raw >> (start_word & 0x7Fu));
+                          vs_dirty_mask |= dirty_mask;
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
           }
 
           const uint32_t ps_idx = REX_LOAD_U32(cur_pass + 12u);
           if (ps_idx < 1024u && IsPlausibleGuestPtr(ps_base)) {
-            ctx.r3.u64 = cur_pass + 12u;
-            ctx.r4.u64 = ps_base + (((ps_idx * 3u) << 2) & 0xFFFFFFFCu);
-            ctx.r5.u64 = r27_shader_plus_20;
-            ctx.r6.u64 = shader_data_8;
-            ctx.lr = 0x828C8FDCu;
-            sub_828C8E80(ctx, base);
-          } else if (s_pass_diag_count.fetch_add(1, std::memory_order_relaxed) < 16u) {
-            REXLOG_WARN("diag-828C8F38: bad-ps pass={:08X} ps_idx={} ps_tab={:08X} ps_base={:08X}",
-                        cur_pass, ps_idx, r25_ps_table, ps_base);
+            const uint32_t arg1 = ps_base + (((ps_idx * 3u) << 2) & 0xFFFFFFFCu);
+            if (IsPlausibleGuestPtr(arg1)) {
+              constexpr uint32_t kBoundPixelShaderGlobal = 0x82B0D8BCu;
+              const uint32_t ps = LoadU32(base, arg1 + 8u);
+              if (LoadU32(base, kBoundPixelShaderGlobal) != ps) {
+                StoreU32(base, kBoundPixelShaderGlobal, ps);
+                ctx.r3.u64 = grc_dev;
+                ctx.r4.u64 = ps;
+                ctx.lr = 0x828C8EA8u;
+                sub_82A424A8(ctx, base);
+              }
+              const uint16_t ps_param_count = REX_LOAD_U16(cur_pass + 20u);
+              if (tables_ok && ps_param_count > 0u && ps_param_count <= 256u) {
+                const uint32_t ps_pair_table = REX_LOAD_U32(cur_pass + 16u);
+                const uint32_t arg1_table = REX_LOAD_U32(arg1 + 4u);
+                if (IsPlausibleGuestPtr(ps_pair_table) && IsPlausibleGuestPtr(arg1_table)) {
+                  for (uint16_t i = 0; i < ps_param_count; ++i) {
+                    const uint16_t pair = REX_LOAD_U16(ps_pair_table + (static_cast<uint32_t>(i) << 1));
+                    const uint32_t idx0 = static_cast<uint32_t>(pair >> 8);
+                    const uint32_t param_idx = static_cast<uint32_t>(pair & 0xFFu);
+                    const uint8_t is_const = LoadU8(base, type_table + idx0);
+                    const uint32_t val = LoadU32(base, val_table + (idx0 << 2));
+                    const uint32_t param_entry = arg1_table + (param_idx << 3);
+                    if (is_const == 0u) {
+                      if (effect_ok) [[likely]] {
+                        const uint32_t stage = LoadU16(base, param_entry + 2u);
+                        const uint32_t desc = effect_base + (idx0 * 48u);
+                        const int32_t override_count =
+                            static_cast<int32_t>((static_cast<uint32_t>(LoadU8(base, desc + 2u)) >> 1) & 0x7FFFFFFFu);
+                        const uint32_t overrides = LoadU32(base, desc + 24u);
+                        ctx.lr = 0x828C8F08u;
+                        BindRAGEEffectTextureStage(ctx, base, stage, val, override_count, overrides);
+                      }
+                    } else if (val >= 0x00010000u && val < 0xF0000000u) [[likely]] {
+                      const uint32_t param_type = LoadU8(base, param_entry);
+                      const uint32_t reg_idx = LoadU16(base, param_entry + 2u);
+                      if (param_type == 1u) [[unlikely]] {
+                        const uint32_t packed = (uint32_t(LoadU8(base, val + 11u)) << 16) |
+                                                (uint32_t(LoadU8(base, val + 7u)) << 8) |
+                                                uint32_t(LoadU8(base, val + 3u));
+                        StoreU32(base, grc_dev + 10208u + (reg_idx << 2), packed);
+                        int_bool_dirty_mask |= (1ULL << 56);
+                      } else if (param_type == 7u) [[unlikely]] {
+                        const uint32_t bit_val = LoadU32(base, val) & 1u;
+                        const uint32_t bit = reg_idx & 0x1Fu;
+                        const uint32_t offset = (2532u + (reg_idx >> 5)) << 2;
+                        const uint32_t current = LoadU32(base, grc_dev + offset);
+                        const uint32_t mask = 1u << bit;
+                        StoreU32(base, grc_dev + offset, (current & ~mask) | (bit_val << bit));
+                        int_bool_dirty_mask |= (1ULL << 56);
+                      } else [[likely]] {
+                        const uint32_t stride = LoadU8(base, 0x82B0D32Cu + param_type);
+                        const uint32_t reg_count = stride * static_cast<uint32_t>(is_const);
+                        if (reg_count > 0u && (reg_idx + reg_count) <= 256u) [[likely]] {
+                          std::memcpy(device_memory + 6016u + (reg_idx << 4), base + val,
+                                      static_cast<size_t>(reg_count) << 4);
+                          const uint32_t start_word = reg_idx >> 2;
+                          const uint32_t end_block = (reg_idx + reg_count - 1u) >> 2;
+                          const uint32_t shift = std::min<uint32_t>(end_block - start_word, 63u);
+                          const uint64_t mask_raw =
+                              static_cast<uint64_t>(static_cast<int64_t>(0x8000000000000000ULL) >> shift);
+                          const uint64_t dirty_mask = (start_word & 0x40u) ? 0ULL : (mask_raw >> (start_word & 0x7Fu));
+                          ps_dirty_mask |= dirty_mask;
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          // 3. Coalesced dirty mask flush before geometry draw
+          if (vs_dirty_mask != 0ULL) {
+            StoreU64(base, grc_dev, LoadU64(base, grc_dev) | vs_dirty_mask);
+          }
+          if (ps_dirty_mask != 0ULL) {
+            StoreU64(base, grc_dev + 8u, LoadU64(base, grc_dev + 8u) | ps_dirty_mask);
+          }
+          if (int_bool_dirty_mask != 0ULL) {
+            StoreU64(base, grc_dev + 32u, LoadU64(base, grc_dev + 32u) | int_bool_dirty_mask);
           }
         }
-      } // end fast path inline
+      }
 
-      ctx.r3.u64 = geom;
-      ctx.lr = 0x828C669Cu;
+      // 4. Geometry Draw (preserves FastGeometryDraw LightingContext fallback & RageDirectDrawCommand)
       if (draw_fn == 0x828E7000u) [[likely]] {
-        sub_828E7000(ctx, base);
+        uint32_t r30_slot = 0u;
+        if (static_cast<int32_t>(REX_LOAD_U32(geom + 72u)) != 0) [[unlikely]] {
+          r30_slot = REX_LOAD_U32(0x831C6214u);
+        }
+        const uint32_t r11_ib_off = ((r30_slot + 7u) << 2) & 0xFFFFFFFCu;
+        const uint32_t r10_vb_off = ((r30_slot + 3u) << 2) & 0xFFFFFFFCu;
+        const uint32_t stream1_buf = REX_LOAD_U32(geom + 68u);
+        const uint32_t vdecl = stream1_buf ? REX_LOAD_U32(geom + 64u) : REX_LOAD_U32(geom + 4u);
+        const uint32_t caller = stream1_buf ? 0x828E7074u : 0x828E70A8u;
+        FastGeometryDraw(base, REX_LOAD_U16(geom + 54u), vdecl,
+                         REX_LOAD_U32(geom + r10_vb_off), REX_LOAD_U32(geom + r11_ib_off),
+                         REX_LOAD_U32(geom + 44u), caller, stream1_buf);
       } else {
+        ctx.r3.u64 = geom;
         ctx.r4.u64 = r24_geom_idx;
         ctx.r10.u64 = (r24_geom_idx << 2) & 0xFFFFFFFCu;
         ctx.r11.u64 = draw_fn;
+        ctx.lr = 0x828C669Cu;
         const auto s_ctr = ctx.ctr;
         ctx.ctr.u64 = draw_fn;
         REX_CALL_INDIRECT_FUNC(draw_fn);
