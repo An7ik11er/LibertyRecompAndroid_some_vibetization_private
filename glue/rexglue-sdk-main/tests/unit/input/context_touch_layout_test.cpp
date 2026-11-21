@@ -181,6 +181,12 @@ TEST_CASE("phone is an overlay that preserves base movement and camera", "[input
     CheckButton(phone, A::kPhoneDown, X_INPUT_GAMEPAD_DPAD_DOWN);
     CheckButton(phone, A::kPhoneLeft, X_INPUT_GAMEPAD_DPAD_LEFT);
     CheckButton(phone, A::kPhoneRight, X_INPUT_GAMEPAD_DPAD_RIGHT);
+    if (mode == M::kOnFoot) {
+      for (const A combat : {A::kFire, A::kAim, A::kRunSprint, A::kJumpClimb}) {
+        const auto* control = FindAction(phone, combat);
+        CHECK((!control || !control->visible));
+      }
+    }
     if (mode == M::kVehicleAutomobile) CheckTrigger(phone, A::kAccelerate, 2);
     if (mode == M::kVehicleHelicopter) CheckTrigger(phone, A::kHeliAscend, 2);
   }
@@ -321,7 +327,7 @@ TEST_CASE("an accepted analogue prompt exposes both script sticks", "[input][tou
                             ContextTouchLayoutOptions{.melee = true}}) {
     const auto on_foot = SemanticLayout(M::kOnFoot, options, accepted);
     if (options.melee) CheckButton(on_foot, A::kFire, X_INPUT_GAMEPAD_B);
-    else CheckTrigger(on_foot, A::kFire, 2);
+    else if (!options.phone_visible) CheckTrigger(on_foot, A::kFire, 2);
     CHECK(VisibleAction(on_foot, A::kActivityRightStick).kind == K::kRightStick);
   }
   for (const A action : {A::kMove, A::kActivityRightStick}) {

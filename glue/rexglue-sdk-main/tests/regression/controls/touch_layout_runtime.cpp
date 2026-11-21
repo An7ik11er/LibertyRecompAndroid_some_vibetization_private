@@ -78,8 +78,8 @@ int main(int argc, char** argv) {
             std::abort();
           };
           if (mode == ContextTouchMode::kOnFoot) {
-            require_action(TouchAction::kFire);
             if (!options.phone_visible) {
+              require_action(TouchAction::kFire);
               for (const auto action : {TouchAction::kRunSprint, TouchAction::kJumpClimb,
                    TouchAction::kAim, TouchAction::kWeaponWheel, TouchAction::kCameraCycle,
                    TouchAction::kLookBehind, TouchAction::kPhone}) require_action(action);

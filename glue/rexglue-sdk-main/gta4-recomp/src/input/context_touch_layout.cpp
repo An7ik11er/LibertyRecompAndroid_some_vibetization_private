@@ -414,23 +414,25 @@ ContextTouchLayout BuildSemanticLayout(ContextTouchMode mode, const ContextTouch
       right_stick.script = move.script;
     }
     if (mode == ContextTouchMode::kOnFoot || mode == ContextTouchMode::kPhone) {
-      if (options.melee) {
-        primary(A::kFire, "PUNCH", X_INPUT_GAMEPAD_B, 0, 0);
-        primary(A::kContext, "ALT", X_INPUT_GAMEPAD_Y, 0, 1);
-        primary(A::kJumpClimb, "KICK", X_INPUT_GAMEPAD_X, 0, 2);
-        primary(A::kRunSprint, "BLOCK", X_INPUT_GAMEPAD_A, 0, 3);
-      } else if (options.armed || options.aiming || options.in_cover) {
-        primary(A::kFire, options.armed ? "FIRE" : "ATTACK", 0, 2, 0, V::kLButton);
-        primary(A::kAim, "AIM", 0, 1, 1, V::kRButton);
-        primary(A::kCover, options.in_cover ? "EXIT COVER" : "COVER", X_INPUT_GAMEPAD_RIGHT_SHOULDER, 0, 2, V::kQ);
-        primary(A::kReload, "RELOAD", X_INPUT_GAMEPAD_B, 0, 3, V::kR);
-      } else {
-        // Retail attack remains RT before a melee task is active. The melee
-        // task uses B/Y/X/A for punch/alternate/kick/block above.
-        primary(A::kFire, "ATTACK", 0, 2, 0, V::kLButton);
-        primary(A::kRunSprint, "RUN", X_INPUT_GAMEPAD_A, 0, 1, V::kShift);
-        primary(A::kJumpClimb, "JUMP", X_INPUT_GAMEPAD_X, 0, 2, V::kSpace);
-        primary(A::kAim, "AIM", 0, 1, 3, V::kRButton);
+      if (mode == ContextTouchMode::kPhone || !options.phone_visible) {
+        if (options.melee) {
+          primary(A::kFire, "PUNCH", X_INPUT_GAMEPAD_B, 0, 0);
+          primary(A::kContext, "ALT", X_INPUT_GAMEPAD_Y, 0, 1);
+          primary(A::kJumpClimb, "KICK", X_INPUT_GAMEPAD_X, 0, 2);
+          primary(A::kRunSprint, "BLOCK", X_INPUT_GAMEPAD_A, 0, 3);
+        } else if (options.armed || options.aiming || options.in_cover) {
+          primary(A::kFire, options.armed ? "FIRE" : "ATTACK", 0, 2, 0, V::kLButton);
+          primary(A::kAim, "AIM", 0, 1, 1, V::kRButton);
+          primary(A::kCover, options.in_cover ? "EXIT COVER" : "COVER", X_INPUT_GAMEPAD_RIGHT_SHOULDER, 0, 2, V::kQ);
+          primary(A::kReload, "RELOAD", X_INPUT_GAMEPAD_B, 0, 3, V::kR);
+        } else {
+          // Retail attack remains RT before a melee task is active. The melee
+          // task uses B/Y/X/A for punch/alternate/kick/block above.
+          primary(A::kFire, "ATTACK", 0, 2, 0, V::kLButton);
+          primary(A::kRunSprint, "RUN", X_INPUT_GAMEPAD_A, 0, 1, V::kShift);
+          primary(A::kJumpClimb, "JUMP", X_INPUT_GAMEPAD_X, 0, 2, V::kSpace);
+          primary(A::kAim, "AIM", 0, 1, 3, V::kRButton);
+        }
       }
       hidden(A::kFire, "FIRE", 0, 2, V::kLButton);
       hidden(A::kAim, "AIM", 0, 1, V::kRButton);

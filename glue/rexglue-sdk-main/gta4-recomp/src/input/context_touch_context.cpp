@@ -391,13 +391,15 @@ TouchContextSnapshot ReadTouchContextFacts(const TouchContextMemory& memory,
     const auto vehicle = read.U32(*ped, 2688);
     const auto driver = vehicle && *vehicle ? read.U32(*vehicle, 3904) : std::nullopt;
     const auto vtable = vehicle && *vehicle ? read.U32(*vehicle) : std::nullopt;
+    const auto vehicle_class = vehicle && *vehicle ? read.U32(*vehicle, 4836) : std::nullopt;
     if (!vehicle || !*vehicle || !driver || !vtable) {
       out.gameplay_allowed = false;
       out.base_mode = ContextTouchMode::kVehicleDriverUnknown;
     } else {
       out.vehicle_identity = *vehicle;
       if (*driver != *ped) out.base_mode = ContextTouchMode::kVehiclePassenger;
-      else if (*vtable == 0x8200B8D4) out.base_mode = ContextTouchMode::kVehicleHelicopter;
+      else if ((vehicle_class && *vehicle_class == 4) || *vtable == 0x8200B8D4)
+        out.base_mode = ContextTouchMode::kVehicleHelicopter;
       else if (*vtable == 0x8204205C) out.base_mode = ContextTouchMode::kVehicleBike;
       else if (*vtable == 0x8204356C) out.base_mode = ContextTouchMode::kVehicleBoat;
       else if (*vtable == 0x82041D8C) out.base_mode = ContextTouchMode::kVehicleAutomobile;
