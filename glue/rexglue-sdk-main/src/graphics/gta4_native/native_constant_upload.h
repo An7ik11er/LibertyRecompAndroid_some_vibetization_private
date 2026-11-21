@@ -40,21 +40,22 @@ class NativeConstantUploadTracker {
       return std::nullopt;
     }
 
-    size_t written = 0;
-    // Only the initialized, cached prefix may be read. Uninitialized tails and
-    // uncached heaps take a single sequential copy/conversion path instead of
-    // repeating comparison and initialization branches for every register.
-    // Allocations may start past the initialized prefix (alignment gaps);
-    // those bytes are written whole, without a comparison.
-    const size_t existing = compare_existing && offset < initialized_bytes_
-        ? std::min(source.size(), initialized_bytes_ - offset) : 0;
-    const auto convert = [&](uint8_t* dst, const uint8_t* src, size_t bytes) {
-      if (!guest_word_order) { std::memcpy(dst, src, bytes); return; }
+    uint8_t* const dst_base = storage.data() + offset;
+    const uint8_t* const src_base = source.data();
+    const size_t total_bytes = source.size();
+    const size_t existing = (compare_existing && offset < initialized_bytes_)
+                                ? std::min(total_bytes, initialized_bytes_ - offset)
+                                : 0;
+
+    const auto stream_write = [guest_word_order](uint8_t* __restrict dst,
+                                                 const uint8_t* __restrict src,
+                                                 size_t bytes) noexcept {
+      if (!guest_word_order) {
+        std::memcpy(dst, src, bytes);
+        return;
+      }
       size_t i = 0;
 #if defined(__aarch64__)
-      // The destination is usually write-combined upload memory: the scalar
-      // loop (a 4-byte store per word, ~1.7M per frame at the bridge) was the
-      // recorder's hottest code. Swap 16 bytes per register, store 64 at once.
       for (; i + 64 <= bytes; i += 64) {
         uint8x16x4_t block = vld1q_u8_x4(src + i);
         block.val[0] = vrev32q_u8(block.val[0]);
@@ -63,22 +64,80 @@ class NativeConstantUploadTracker {
         block.val[3] = vrev32q_u8(block.val[3]);
         vst1q_u8_x4(dst + i, block);
       }
-      for (; i + 16 <= bytes; i += 16) vst1q_u8(dst + i, vrev32q_u8(vld1q_u8(src + i)));
-#endif
+      for (; i + 16 <= bytes; i += 16) {
+        vst1q_u8(dst + i, vrev32q_u8(vld1q_u8(src + i)));
+      }
+#else
       for (; i < bytes; i += sizeof(uint32_t)) {
         uint32_t word;
         std::memcpy(&word, src + i, sizeof(word));
         word = std::byteswap(word);
         std::memcpy(dst + i, &word, sizeof(word));
       }
+#endif
     };
+
+    // Fast path: no read-before-write (mandatory for write-combined GPU upload memory
+    // and first-time arena growth). Pure sequential 64B NEON stores.
+    if (existing == 0) {
+      stream_write(dst_base, src_base, total_bytes);
+      initialized_bytes_ = std::max(initialized_bytes_, offset + total_bytes);
+      written_bytes_ += total_bytes;
+      return total_bytes;
+    }
+
+    size_t written = 0;
     size_t relative = 0;
-    // Reject equal cache-line-sized groups in one comparison. Changed groups
-    // still store/count only different registers, preserving exact bit patterns.
-    for (; existing - relative >= 64; relative += 64) {
+#if defined(__aarch64__)
+    // Single-read, zero-stack-copy NEON compare-and-store for cached buffers.
+    for (; relative + 64 <= existing; relative += 64) {
+      uint8x16x4_t conv = vld1q_u8_x4(src_base + relative);
+      if (guest_word_order) {
+        conv.val[0] = vrev32q_u8(conv.val[0]);
+        conv.val[1] = vrev32q_u8(conv.val[1]);
+        conv.val[2] = vrev32q_u8(conv.val[2]);
+        conv.val[3] = vrev32q_u8(conv.val[3]);
+      }
+      const uint8x16x4_t cur = vld1q_u8_x4(dst_base + relative);
+      const uint8x16_t d0 = veorq_u8(conv.val[0], cur.val[0]);
+      const uint8x16_t d1 = veorq_u8(conv.val[1], cur.val[1]);
+      const uint8x16_t d2 = veorq_u8(conv.val[2], cur.val[2]);
+      const uint8x16_t d3 = veorq_u8(conv.val[3], cur.val[3]);
+      const uint8x16_t any_diff = vorrq_u8(vorrq_u8(d0, d1), vorrq_u8(d2, d3));
+      if (vmaxvq_u32(vreinterpretq_u32_u8(any_diff)) != 0u) {
+        const uint32_t m0 = vmaxvq_u32(vreinterpretq_u32_u8(d0)) != 0u ? 1u : 0u;
+        const uint32_t m1 = vmaxvq_u32(vreinterpretq_u32_u8(d1)) != 0u ? 1u : 0u;
+        const uint32_t m2 = vmaxvq_u32(vreinterpretq_u32_u8(d2)) != 0u ? 1u : 0u;
+        const uint32_t m3 = vmaxvq_u32(vreinterpretq_u32_u8(d3)) != 0u ? 1u : 0u;
+        const uint32_t dirty_lanes = m0 + m1 + m2 + m3;
+        if (dirty_lanes == 4u) {
+          vst1q_u8_x4(dst_base + relative, conv);
+        } else {
+          if (m0) vst1q_u8(dst_base + relative + 0, conv.val[0]);
+          if (m1) vst1q_u8(dst_base + relative + 16, conv.val[1]);
+          if (m2) vst1q_u8(dst_base + relative + 32, conv.val[2]);
+          if (m3) vst1q_u8(dst_base + relative + 48, conv.val[3]);
+        }
+        written += size_t(dirty_lanes) * kRegisterBytes;
+      }
+    }
+    for (; relative < existing; relative += kRegisterBytes) {
+      uint8x16_t conv = vld1q_u8(src_base + relative);
+      if (guest_word_order) {
+        conv = vrev32q_u8(conv);
+      }
+      const uint8x16_t cur = vld1q_u8(dst_base + relative);
+      const uint8x16_t diff = veorq_u8(conv, cur);
+      if (vmaxvq_u32(vreinterpretq_u32_u8(diff)) != 0u) {
+        vst1q_u8(dst_base + relative, conv);
+        written += kRegisterBytes;
+      }
+    }
+#else
+    for (; relative + 64 <= existing; relative += 64) {
       alignas(16) std::array<uint8_t, 64> converted;
-      convert(converted.data(), source.data() + relative, converted.size());
-      uint8_t* destination = storage.data() + offset + relative;
+      stream_write(converted.data(), src_base + relative, converted.size());
+      uint8_t* destination = dst_base + relative;
       if (std::memcmp(destination, converted.data(), converted.size()) == 0) continue;
       for (size_t lane = 0; lane < converted.size(); lane += kRegisterBytes) {
         if (std::memcmp(destination + lane, converted.data() + lane, kRegisterBytes) != 0) {
@@ -88,19 +147,22 @@ class NativeConstantUploadTracker {
       }
     }
     for (; relative < existing; relative += kRegisterBytes) {
-      std::array<uint8_t, kRegisterBytes> converted;
-      convert(converted.data(), source.data() + relative, converted.size());
-      uint8_t* destination = storage.data() + offset + relative;
+      alignas(16) std::array<uint8_t, kRegisterBytes> converted;
+      stream_write(converted.data(), src_base + relative, converted.size());
+      uint8_t* destination = dst_base + relative;
       if (std::memcmp(destination, converted.data(), converted.size()) != 0) {
         std::memcpy(destination, converted.data(), converted.size());
         written += kRegisterBytes;
       }
     }
-    if (relative < source.size()) {
-      convert(storage.data() + offset + relative, source.data() + relative, source.size() - relative);
-      written += source.size() - relative;
+#endif
+
+    if (relative < total_bytes) {
+      const size_t tail = total_bytes - relative;
+      stream_write(dst_base + relative, src_base + relative, tail);
+      written += tail;
     }
-    initialized_bytes_ = std::max(initialized_bytes_, offset + source.size());
+    initialized_bytes_ = std::max(initialized_bytes_, offset + total_bytes);
     written_bytes_ += written;
     return written;
   }

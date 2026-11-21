@@ -387,9 +387,19 @@ REXCVAR_DEFINE_BOOL(gta4_native_prepared_binding_cache, true, "GTA IV/Graphics/N
 template <typename Shader>
 static uint32_t NativeConstantUploadPrefix(const Shader* shader, size_t bank_size) {
   // No pixel shader reads nothing; one register keeps the binding non-empty.
-  const uint32_t used = shader ? shader->upload_constant_bytes : 16u;
+  const uint32_t used = std::max<uint32_t>(16u, shader ? shader->upload_constant_bytes : 16u);
   if (used == UINT32_MAX) return uint32_t(bank_size);
-  return uint32_t(std::min<size_t>(bank_size, std::max<uint32_t>(16u, (used + 255u) & ~255u)));
+  uint32_t rounded;
+  if (used <= 192u) {
+    rounded = (used + 63u) & ~63u;
+  } else if (used <= 240u) {
+    // 240 B = 15 * 16 B registers: stays on fast inline XXH3_len_129to240 path
+    // instead of crossing the >240 B XXH3_hashLong_64b_default cliff.
+    rounded = 240u;
+  } else {
+    rounded = (used + 63u) & ~63u;
+  }
+  return uint32_t(std::min<size_t>(bank_size, rounded));
 }
 template <typename Shader>
 static uint32_t NativeWorkerRingUploadPrefix(const Shader* shader, size_t bank_size) {
@@ -6533,6 +6543,8 @@ Gta4NativeGraphicsSystem::CreateResolvedTextureResource(const ResolveCommand& co
 uint64_t Gta4NativeGraphicsSystem::SyncBufferCaptureTables() {
   const uint64_t clear_epoch = buffer_resources_clear_epoch_.load(std::memory_order_acquire);
   if (buffer_fast_table_clear_epoch_ != clear_epoch) [[unlikely]] {
+    buffer_capture_l0_ = {};
+    buffer_capture_l0_epoch_ = clear_epoch;
     buffer_capture_l1_table_.fill({});
     for (auto& slot : buffer_capture_fast_table_) {
       slot = {};
@@ -6543,6 +6555,8 @@ uint64_t Gta4NativeGraphicsSystem::SyncBufferCaptureTables() {
 }
 
 void Gta4NativeGraphicsSystem::ForgetBufferCapture(uint32_t handle) {
+  if (buffer_capture_l0_[0].handle == handle) buffer_capture_l0_[0] = {};
+  if (buffer_capture_l0_[1].handle == handle) buffer_capture_l0_[1] = {};
   const uint32_t l1_base = BufferL1SetBase(handle);
   for (size_t way = 0; way < kBufferCaptureL1Ways; ++way) {
     auto& l1 = buffer_capture_l1_table_[l1_base + way];
@@ -6568,35 +6582,85 @@ bool Gta4NativeGraphicsSystem::CaptureBufferResourceIntoEpoch(
   if (!handle) [[unlikely]] return false;
 
   const uint32_t current_serial = capture_keepalive_serial_;
-  static const bool use_keepalive = REXCVAR_GET(gta4_native_capture_keepalive);
-
-  if (use_keepalive && current_serial) [[likely]] {
-    const uint32_t l1_base = BufferL1SetBase(handle);
-    BufferL1MruEntry& l0 = buffer_capture_l1_table_[l1_base];
-    BufferL1MruEntry& l1 = buffer_capture_l1_table_[l1_base + 1];
-    BufferL1MruEntry& l2 = buffer_capture_l1_table_[l1_base + 2];
-    BufferL1MruEntry& l3 = buffer_capture_l1_table_[l1_base + 3];
-    BufferL1MruEntry* matched = nullptr;
-    if (l0.handle == handle && l0.raw && l0.guest_object) {
-      matched = &l0;
-    } else if (l1.handle == handle && l1.raw && l1.guest_object) {
-      matched = &l1;
-    } else if (l2.handle == handle && l2.raw && l2.guest_object) {
-      matched = &l2;
-    } else if (l3.handle == handle && l3.raw && l3.guest_object) {
-      matched = &l3;
+  if (capture_keepalive_enabled_ && current_serial) [[likely]] {
+    // 0. Exact 2-way LRU L0 cache (fits in ~2 hot L1D lines for back-to-back VB0 + IB reuse).
+    if (buffer_capture_l0_epoch_ != clear_epoch) [[unlikely]] {
+      buffer_capture_l0_[0].handle = 0;
+      buffer_capture_l0_[1].handle = 0;
+      buffer_capture_l0_epoch_ = clear_epoch;
+    } else {
+      for (uint32_t s = 0; s < 2u; ++s) {
+        BufferL1MruEntry& l0_entry = buffer_capture_l0_[s];
+        if (l0_entry.handle == handle && l0_entry.alias_serial == current_serial &&
+            l0_entry.raw && l0_entry.guest_object) {
+          static_assert(kResourceSizeOffset == kResourceDataOffset + sizeof(uint32_t));
+          const uint8_t* const object = l0_entry.guest_object;
+          uint32_t raw_flags;
+          uint64_t addr_size_pair;
+          std::memcpy(&raw_flags, object, sizeof(raw_flags));
+          std::memcpy(&addr_size_pair, object + kResourceDataOffset, sizeof(addr_size_pair));
+          const uint32_t raw_addr_word = uint32_t(addr_size_pair);
+          const uint32_t raw_size_word = uint32_t(addr_size_pair >> 32);
+          const uint32_t header_diff =
+              (l0_entry.raw_flags ^ raw_flags) |
+              (l0_entry.raw_address_word ^ raw_addr_word) |
+              (l0_entry.raw_size_word ^ raw_size_word);
+          if (header_diff == 0u) [[likely]] {
+            buffer_capture_l0_lru_slot_ = s ^ 1u;
+            if (l0_entry.last_frame != current_frame) [[unlikely]] {
+              l0_entry.last_frame = current_frame;
+              if (l0_entry.raw->last_used_frame.load(std::memory_order_relaxed) != current_frame) {
+                l0_entry.raw->last_used_frame.store(current_frame, std::memory_order_relaxed);
+              }
+            }
+            out = l0_entry.raw;
+            return true;
+          }
+          // Guest header mutated in-place: evict stale L0 entry and fall through.
+          l0_entry.handle = 0;
+          break;
+        }
+      }
     }
+
+    // 1. 4-way L1 table lookup: test way 0 first (prefetched by SubmitRageDirectDraw),
+    //    and promote way 1/2/3 hits into way 0 so future prefetches land on the hot buffer.
+    const uint32_t l1_base = BufferL1SetBase(handle);
+    BufferL1MruEntry& way0 = buffer_capture_l1_table_[l1_base];
+    BufferL1MruEntry* matched = nullptr;
+    if (way0.handle == handle && way0.raw && way0.guest_object) [[likely]] {
+      matched = &way0;
+    } else {
+      BufferL1MruEntry& way1 = buffer_capture_l1_table_[l1_base + 1];
+      if (way1.handle == handle && way1.raw && way1.guest_object) {
+        matched = &way1;
+      } else {
+        BufferL1MruEntry& way2 = buffer_capture_l1_table_[l1_base + 2];
+        if (way2.handle == handle && way2.raw && way2.guest_object) {
+          matched = &way2;
+        } else {
+          BufferL1MruEntry& way3 = buffer_capture_l1_table_[l1_base + 3];
+          if (way3.handle == handle && way3.raw && way3.guest_object) {
+            matched = &way3;
+          }
+        }
+      }
+    }
+
     if (matched) [[likely]] {
       static_assert(kResourceSizeOffset == kResourceDataOffset + sizeof(uint32_t));
-      const uint8_t* object = matched->guest_object;
+      const uint8_t* const object = matched->guest_object;
       uint32_t raw_flags;
       uint64_t addr_size_pair;
       std::memcpy(&raw_flags, object, sizeof(raw_flags));
       std::memcpy(&addr_size_pair, object + kResourceDataOffset, sizeof(addr_size_pair));
       const uint32_t raw_addr_word = uint32_t(addr_size_pair);
       const uint32_t raw_size_word = uint32_t(addr_size_pair >> 32);
-      if (matched->raw_flags == raw_flags && matched->raw_address_word == raw_addr_word &&
-          matched->raw_size_word == raw_size_word) [[likely]] {
+      const uint32_t header_diff =
+          (matched->raw_flags ^ raw_flags) |
+          (matched->raw_address_word ^ raw_addr_word) |
+          (matched->raw_size_word ^ raw_size_word);
+      if (header_diff == 0u) [[likely]] {
         bool promoted = (matched->alias_serial == current_serial);
         if (!promoted && matched->raw->keepalive_serial == current_serial) [[likely]] {
           matched->alias_serial = current_serial;
@@ -6633,6 +6697,13 @@ bool Gta4NativeGraphicsSystem::CaptureBufferResourceIntoEpoch(
               matched->raw->last_used_frame.store(current_frame, std::memory_order_relaxed);
             }
           }
+          if (matched != &way0) {
+            std::swap(way0, *matched);
+            matched = &way0;
+          }
+          const uint32_t insert_slot = buffer_capture_l0_lru_slot_;
+          buffer_capture_l0_[insert_slot] = *matched;
+          buffer_capture_l0_lru_slot_ = insert_slot ^ 1u;
           out = matched->raw;
           return true;
         }
@@ -6698,6 +6769,13 @@ bool Gta4NativeGraphicsSystem::CaptureBufferResourceIntoSlow(
               SelectBufferL1Slot(BufferL1SetBase(handle), handle, capture_keepalive_serial_);
           l1_slot = {handle, capture_keepalive_serial_, raw_flags, raw_addr_word, raw_size_word,
                      current_frame, object, raw};
+          if (buffer_capture_l0_epoch_ != clear_epoch) {
+            buffer_capture_l0_ = {};
+            buffer_capture_l0_epoch_ = clear_epoch;
+          }
+          const uint32_t insert_slot = buffer_capture_l0_lru_slot_;
+          buffer_capture_l0_[insert_slot] = l1_slot;
+          buffer_capture_l0_lru_slot_ = insert_slot ^ 1u;
           out = raw;
           return true;
         }
@@ -19795,6 +19873,7 @@ bool Gta4NativeGraphicsSystem::CreateResolveConversionObjects() {
 bool Gta4NativeGraphicsSystem::InitializeNativeRendererObjects() {
   static_assert(sizeof(NativePushConstants) == 24);
   RefreshRecorderFrameCvars();
+  capture_keepalive_enabled_ = REXCVAR_GET(gta4_native_capture_keepalive);
   shader_override_mode_ = ParseShaderOverrideMode(REXCVAR_GET(gta4_native_light_overrides));
   if (native_renderer_recovery_failed_) {
     return false;
@@ -27116,20 +27195,27 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
     can_reuse_shared_allocation = true;
     active_shared_memo = &last_shared_draw_memo_;
   } else {
-    const size_t fast_shared_slot =
-        (size_t(pipeline_serial * 0x9E3779B97F4A7C15ull) ^
-         size_t((reinterpret_cast<uintptr_t>(command.fixed_function_state.get()) >> 6) * 0xBF58476D1CE4E5B9ull) ^
-         size_t(command.texture_inputs_signature) ^
-         size_t(command_device) ^
-         size_t(vertex_booleans) ^ (size_t(pixel_booleans) << 16)) &
-        (fast_shared_memo_cache_.size() - 1);
-    FastSharedConstMemo& s_fast_shared_memo = fast_shared_memo_cache_[fast_shared_slot];
-    if (valid_signature && matches_memo(s_fast_shared_memo)) [[likely]] {
+    const size_t fast_shared_base =
+        ((size_t(pipeline_serial * 0x9E3779B97F4A7C15ull) ^
+          size_t((reinterpret_cast<uintptr_t>(command.fixed_function_state.get()) >> 6) * 0xBF58476D1CE4E5B9ull) ^
+          size_t(command.texture_inputs_signature) ^
+          size_t(command_device) ^
+          size_t(vertex_booleans) ^ (size_t(pixel_booleans) << 16)) &
+         ((fast_shared_memo_cache_.size() >> 1) - 1)) << 1;
+    FastSharedConstMemo& way0 = fast_shared_memo_cache_[fast_shared_base];
+    FastSharedConstMemo& way1 = fast_shared_memo_cache_[fast_shared_base + 1];
+    if (valid_signature && matches_memo(way0)) [[likely]] {
       can_reuse_shared_allocation = true;
-      active_shared_memo = &s_fast_shared_memo;
-      last_shared_draw_memo_ = s_fast_shared_memo;
+      active_shared_memo = &way0;
+      last_shared_draw_memo_ = way0;
+    } else if (valid_signature && matches_memo(way1)) [[likely]] {
+      std::swap(way0, way1);
+      can_reuse_shared_allocation = true;
+      active_shared_memo = &way0;
+      last_shared_draw_memo_ = way0;
     } else {
-      active_shared_memo = &s_fast_shared_memo;
+      way1 = way0;
+      active_shared_memo = &way0;
     }
   }
 

@@ -3185,6 +3185,10 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     return ((handle * 0x9E3779B1u) >> (32 - 12)) * uint32_t(kBufferCaptureFastWays);
   }
   std::array<BufferL1MruEntry, kBufferCaptureL1TableSize> buffer_capture_l1_table_{};  // command_capture_mutex_
+  std::array<BufferL1MruEntry, 2> buffer_capture_l0_{};  // command_capture_mutex_
+  uint64_t buffer_capture_l0_epoch_ = UINT64_MAX;        // command_capture_mutex_
+  uint32_t buffer_capture_l0_lru_slot_ = 0;              // command_capture_mutex_
+  bool capture_keepalive_enabled_ = true;
   std::array<BufferMruEntry, kBufferCaptureFastTableSize> buffer_capture_fast_table_{};  // command_capture_mutex_
   std::atomic<uint64_t> buffer_resources_clear_epoch_{1};
   uint64_t buffer_fast_table_clear_epoch_ = 1;  // command_capture_mutex_

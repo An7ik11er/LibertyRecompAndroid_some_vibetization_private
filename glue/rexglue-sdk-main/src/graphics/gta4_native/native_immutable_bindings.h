@@ -12,6 +12,10 @@
 
 #include <xxhash.h>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 #include "frame_constant_arena.h"
 #include "native_working_set.h"
 #include "stateful_constant_state.h"
@@ -34,6 +38,30 @@ class NativeImmutableBindings {
   // write_bytes: the prefix of the bank the consuming shader can read. Only
   // that prefix is written; the identity includes it, so a shader reading
   // further never reuses a shorter upload of the same version.
+  static bool ConstantsEqual(const uint8_t* a, const uint8_t* b, size_t bytes) noexcept {
+    size_t i = 0;
+#if defined(__aarch64__)
+    for (; i + 64 <= bytes; i += 64) {
+      const uint8x16x4_t va = vld1q_u8_x4(a + i);
+      const uint8x16x4_t vb = vld1q_u8_x4(b + i);
+      const uint8x16_t d0 = veorq_u8(va.val[0], vb.val[0]);
+      const uint8x16_t d1 = veorq_u8(va.val[1], vb.val[1]);
+      const uint8x16_t d2 = veorq_u8(va.val[2], vb.val[2]);
+      const uint8x16_t d3 = veorq_u8(va.val[3], vb.val[3]);
+      const uint8x16_t any = vorrq_u8(vorrq_u8(d0, d1), vorrq_u8(d2, d3));
+      if (vmaxvq_u32(vreinterpretq_u32_u8(any)) != 0u) return false;
+    }
+    for (; i + 16 <= bytes; i += 16) {
+      const uint8x16_t d = veorq_u8(vld1q_u8(a + i), vld1q_u8(b + i));
+      if (vmaxvq_u32(vreinterpretq_u32_u8(d)) != 0u) return false;
+    }
+#endif
+    if (i < bytes) {
+      return std::memcmp(a + i, b + i, bytes - i) == 0;
+    }
+    return true;
+  }
+
   template <typename Materialize, typename Upload>
   Result Bind(FrameConstantKind kind, const std::shared_ptr<const ConstantStateVersion>& version,
               Allocation& allocation, const std::vector<uint8_t>*& bytes,
@@ -42,11 +70,25 @@ class NativeImmutableBindings {
     bytes = nullptr;
     if (!version || !version->byte_size || kind == FrameConstantKind::kShared) return Result::kFailure;
     const uint32_t written = uint32_t(std::min<size_t>(write_bytes, version->byte_size));
+
+    // L0 1-entry cache per shader stage (kVertex / kPixel): avoids hashing & probing
+    // versions_ across consecutive sub-mesh draws sharing the same ConstantStateVersion.
+    const uint32_t l0_slot = (kind == FrameConstantKind::kPixel) ? 1u : 0u;
+    LastBound& l0 = last_bound_[l0_slot];
+    if (l0.version == version.get() && l0.written == written) [[likely]] {
+      allocation = l0.allocation;
+      bytes = l0.bytes;
+      return Result::kVersionHit;
+    }
+
     // User-space pointers fit in 48 bits; the prefix (16-byte units) tags the top.
     const uint64_t tag = written == version->byte_size ? 0 : uint64_t(written / 16 + 1) << 48;
     const FrameConstantIdentity identity{kind, uint64_t(reinterpret_cast<uintptr_t>(version.get())) | tag};
     if (const auto* hit = versions_.Find(identity)) {
-      allocation = hit->allocation; bytes = hit->bytes; return Result::kVersionHit;
+      allocation = hit->allocation;
+      bytes = hit->bytes;
+      l0 = {version.get(), written, allocation, bytes};
+      return Result::kVersionHit;
     }
     bytes = materialize(version);
     if (!bytes || bytes->size() != version->byte_size || bytes->size() > UINT32_MAX) return Result::kFailure;
@@ -63,7 +105,7 @@ class NativeImmutableBindings {
     const NativeConstantContentKey key{content_hash, uint32_t(kind), written};
     const Entry* candidate = contents_.Find(key);
     Result result = Result::kUploaded;
-    if (candidate && std::memcmp(candidate->bytes->data(), bytes->data(), written) == 0) {
+    if (candidate && ConstantsEqual(candidate->bytes->data(), bytes->data(), written)) {
       allocation = candidate->allocation;
       result = Result::kContentHit;
     } else {
@@ -83,6 +125,7 @@ class NativeImmutableBindings {
     const Entry entry{allocation, bytes};
     if (!candidate && !contents_.Insert(key, entry)) return Result::kFailure;
     if (!versions_.Insert(identity, entry)) return Result::kFailure;
+    l0 = {version.get(), written, allocation, bytes};
     return result;
   }
   bool CanReset() const { return versions_.CanResetGeneration() && contents_.CanResetGeneration(); }
@@ -90,6 +133,7 @@ class NativeImmutableBindings {
   bool Reset(std::vector<std::shared_ptr<const ConstantStateVersion>>* released = nullptr) {
     if (!CanReset()) return false;
     versions_.ResetGeneration(); contents_.ResetGeneration();
+    last_bound_.fill({});
     if (released) {
       released->swap(owners_);
       owners_.reserve(released->size());
@@ -105,6 +149,13 @@ class NativeImmutableBindings {
     return owners_.capacity() * sizeof(owners_[0]);
   }
  private:
+  struct LastBound {
+    const ConstantStateVersion* version = nullptr;
+    uint32_t written = 0;
+    Allocation allocation{};
+    const std::vector<uint8_t>* bytes = nullptr;
+  };
+  std::array<LastBound, 2> last_bound_{};
   FrameGenerationMap<FrameConstantIdentity, Entry, FrameConstantIdentityHash> versions_;
   FrameGenerationMap<NativeConstantContentKey, Entry, NativeConstantContentHash> contents_;
   std::vector<std::shared_ptr<const ConstantStateVersion>> owners_;
