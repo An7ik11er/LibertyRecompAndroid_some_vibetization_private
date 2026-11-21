@@ -130,7 +130,9 @@ tools/rage_shader_extract/
 mono_crash.*
 
 # Build results
-[Dd]ebug/
+/[Dd]ebug/
+glue/rexglue-sdk-main/gta4-recomp/src/debug/*.diff
+glue/rexglue-sdk-main/gta4-recomp/src/debug/bacup/
 [Dd]ebugPublic/
 [Rr]elease/
 [Rr]eleases/

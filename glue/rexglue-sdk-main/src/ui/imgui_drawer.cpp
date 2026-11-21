@@ -707,7 +707,7 @@ void ImGuiDrawer::OnKey(KeyEvent& e, bool is_down) {
   if (auto imGuiKey = VirtualKeyToImGuiKey(virtual_key); imGuiKey) {
     io.AddKeyEvent(*imGuiKey, is_down);
     if (*imGuiKey >= ImGuiKey_GamepadStart && *imGuiKey <= ImGuiKey_GamepadRStickDown &&
-        !dialogs_.empty()) {
+        io.NavActive) {
       e.set_handled(true);
     }
   }

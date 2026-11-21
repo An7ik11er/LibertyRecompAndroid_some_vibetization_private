@@ -579,7 +579,8 @@ void GTA4_TouchConsumePoll(PPCContext& context, uint8_t* base, uint64_t epoch) {
   // host/title modal ownership still gate every guest pointer transaction.
   // The on-screen gamepad (gta4_touch_layout=gamepad) reads its own fingers
   // and drives the title like a controller; touches are not game input then.
-  if (!pointer_input_active || title_input_owned || gta4::input::GamepadTouchLayoutSelected() ||
+  if (!pointer_input_active || title_input_owned ||
+      (gta4::input::GamepadTouchLayoutSelected() && !editor_captures) ||
       (!controls_active && !frontend_active && !editor_captures)) {
     AbsolutePointerEvent discarded;
     while (rex::input::TryDequeueAbsolutePointerEvent(&discarded)) {

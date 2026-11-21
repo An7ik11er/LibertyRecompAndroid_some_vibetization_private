@@ -2286,6 +2286,8 @@ extern "C" void sub_82258388(PPCContext& ctx, uint8_t* base) {
   if (IsDisplayScreen(base) && IsOwnedAdvancedPage(base) &&
       IsOwnedJumpRow(base, selected_row, kTouchLayoutEditorKey)) {
     if (!gta4::input::ContextTouchEditorCapturesInput()) {
+      rex::cvar::SetFlagByName("touch_controls", "true");
+      rex::cvar::SetFlagByName("gta4_touch_layout", "context");
       gta4::input::RequestContextTouchEditor();
       ctx.r3.u64 = 1;
     } else {

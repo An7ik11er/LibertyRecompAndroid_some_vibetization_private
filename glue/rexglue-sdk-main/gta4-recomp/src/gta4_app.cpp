@@ -120,7 +120,7 @@ REXCVAR_DEFINE_STRING(gta4_aspect_ratio, "auto", "GTA IV/Graphics/Display",
                       "Render aspect: auto follows the display; fixed ratios fit without stretching")
     .allowed({"auto", "original", "16:9", "16:10", "3:2", "4:3", "5:4", "21:9", "43:18", "32:9", "32:10"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_STRING(gta4_present_mode, "vsync", "GTA IV/Graphics/Display",
+REXCVAR_DEFINE_STRING(gta4_present_mode, "mailbox", "GTA IV/Graphics/Display",
                       "Vertical sync: vsync is On; immediate is Off; auto/mailbox are legacy modes")
     .allowed({"auto", "vsync", "fifo", "mailbox", "immediate"});
 // Android: 30 FPS with VSync divides the 60 Hz panel evenly.
@@ -158,7 +158,7 @@ REXCVAR_DEFINE_UINT32(gta4_shadow_map_base_size, REX_PLATFORM_ANDROID ? 256 : 51
 REXCVAR_DEFINE_DOUBLE(gta4_shadow_distance_guard_factor, 1.0, "GTA IV/Graphics/Shadows",
                       "Multiplier on the shadow distance owned by the 30 FPS guard")
     .range(0.1, 1.0);
-REXCVAR_DEFINE_DOUBLE(gta4_shadow_distance_scale, 2.0, "GTA IV/Graphics/Shadows",
+REXCVAR_DEFINE_DOUBLE(gta4_shadow_distance_scale, 1.0, "GTA IV/Graphics/Shadows",
                       "Multiplier applied to GTA IV's directional shadow range")
     .range(0.1, 4.0)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -191,7 +191,7 @@ REXCVAR_DEFINE_STRING(gta4_reflection_aa, "original", "GTA IV/Graphics/Reflectio
                       "Native reflection capture anti-aliasing: original, off, 2x, or 4x")
     .allowed({"original", "off", "2x", "4x"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_STRING(gta4_reflection_capture_distance, "original",
+REXCVAR_DEFINE_STRING(gta4_reflection_capture_distance, "near",
                       "GTA IV/Graphics/Reflections/Advanced",
                       "Exterior environment capture distance: near (20), original (40), extended (60), or "
                       "far (80)")
@@ -242,7 +242,7 @@ REXCVAR_DEFINE_BOOL(gta4_force_highest_lod, false, "GTA IV/Graphics/LOD",
                     "Prefer the highest resident model LOD regardless of distance");
 REXCVAR_DEFINE_BOOL(gta4_dynamic_draw_distance, false, "GTA IV/Graphics/LOD",
                     "Lower the draw distance while frames miss the frame-rate target, restore it with headroom");
-REXCVAR_DEFINE_DOUBLE(gta4_dynamic_draw_distance_min, 0.7, "GTA IV/Graphics/LOD",
+REXCVAR_DEFINE_DOUBLE(gta4_dynamic_draw_distance_min, 0.8, "GTA IV/Graphics/LOD",
                       "Lowest fraction of the configured draw distance the dynamic controller may use")
     .range(0.25, 1.0);
 // Written by the renderer's controller; multiplies gta4_draw_distance_scale.
@@ -852,7 +852,7 @@ REXCVAR_DEFINE_BOOL(android_gpu_turbo, false, "GTA IV/Performance",
                     "Keep the Adreno GPU at its highest clock (kgsl power control off, as "
                     "libadrenotools' adrenotools_set_turbo does): more heat and battery use");
 
-REXCVAR_DEFINE_BOOL(android_thermal_log, true, "GTA IV/Performance",
+REXCVAR_DEFINE_BOOL(android_thermal_log, false, "GTA IV/Performance",
                     "Log the GPU thermal level, clocks and temperature and the CPU clock limits "
                     "every 5 seconds");
 

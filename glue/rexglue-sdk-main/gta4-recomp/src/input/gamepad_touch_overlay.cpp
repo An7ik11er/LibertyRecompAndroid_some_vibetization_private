@@ -340,4 +340,17 @@ bool ReadGamepadTouchOverlay(uint32_t user, rex::input::X_INPUT_GAMEPAD* output)
   return true;
 }
 
+bool GamepadTouchL3R3Pressed() noexcept {
+  auto& s = state();
+  std::lock_guard lock(s.mutex);
+  if (!s.visible) return false;
+  bool l3 = false, r3 = false;
+  for (size_t i = 0; i < s.controls.size(); ++i) {
+    if (!s.held[i]) continue;
+    if (s.controls[i].button == rex::input::X_INPUT_GAMEPAD_LEFT_THUMB) l3 = true;
+    if (s.controls[i].button == rex::input::X_INPUT_GAMEPAD_RIGHT_THUMB) r3 = true;
+  }
+  return l3 && r3;
+}
+
 }  // namespace gta4::input

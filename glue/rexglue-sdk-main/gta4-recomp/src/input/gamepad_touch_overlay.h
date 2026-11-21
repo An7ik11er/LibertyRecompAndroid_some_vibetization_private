@@ -27,5 +27,7 @@ bool UpdateAndDrawGamepadTouchOverlay(ImDrawList* draw, ImFont* font, float font
                                       float width, float height) noexcept;
 // The current pad state for the touch gamepad provider (user 0 only).
 bool ReadGamepadTouchOverlay(uint32_t user, rex::input::X_INPUT_GAMEPAD* output) noexcept;
+// Returns whether both virtual L3 and R3 buttons are currently held on the touch overlay.
+bool GamepadTouchL3R3Pressed() noexcept;
 
 }  // namespace gta4::input

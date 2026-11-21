@@ -39,7 +39,7 @@
 
 #include <rex/cvar.h>
 
-REXCVAR_DEFINE_BOOL(android_perf_hint, true, "GTA IV/Performance",
+REXCVAR_DEFINE_BOOL(android_perf_hint, false, "GTA IV/Performance",
                     "Report each frame's work to Android's performance hint API so the CPU "
                     "clocks follow the frame budget instead of running at the maximum");
 REXCVAR_DEFINE_DOUBLE(android_perf_hint_target_ms, 30.0, "GTA IV/Performance",

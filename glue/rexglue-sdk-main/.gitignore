@@ -18,7 +18,9 @@
 mono_crash.*
 
 # Build results
-[Dd]ebug/
+/[Dd]ebug/
+gta4-recomp/src/debug/*.diff
+gta4-recomp/src/debug/bacup/
 [Dd]ebugPublic/
 [Rr]elease/
 [Rr]eleases/

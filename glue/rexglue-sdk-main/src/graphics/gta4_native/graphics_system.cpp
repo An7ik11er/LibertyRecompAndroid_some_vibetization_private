@@ -645,7 +645,7 @@ REXCVAR_DEFINE_STRING(
     .allowed({"original", "equal-baseline", "always"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(
-    gta4_native_descriptor_backend, "auto", "GTA IV/Graphics/Native Renderer",
+    gta4_native_descriptor_backend, "indexed", "GTA IV/Graphics/Native Renderer",
     "Draw descriptor backend: indexed Metal/Vulkan argument-buffer tables, cached draw-local "
     "sets, or automatic capability selection")
     .allowed({"auto", "indexed", "cached"})

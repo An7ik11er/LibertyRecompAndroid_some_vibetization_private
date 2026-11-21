@@ -62,7 +62,7 @@ bool ContextTouchOverlay::ResolveIcon(void* context, std::string_view id, Contex
 
 void ContextTouchOverlay::OnDraw(ImGuiIO& io) {
   (void)FlushContextTouchSettings();
-  if (GamepadTouchLayoutSelected()) {
+  if (GamepadTouchLayoutSelected() && !ContextTouchEditorCapturesInput()) {
     repaint_needed_ = UpdateAndDrawGamepadTouchOverlay(
         ImGui::GetForegroundDrawList(), ImGui::GetFont(), ImGui::GetFontSize(), io.DisplaySize.x,
         io.DisplaySize.y);
